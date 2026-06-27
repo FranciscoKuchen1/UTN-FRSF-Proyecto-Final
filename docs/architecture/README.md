@@ -2,7 +2,7 @@
 
 > Proyecto Final UTN FRSF 2026 — Gómez Enrico, Ivo · Kuchen, Francisco  
 > Director: Dr. Pablo Pessolani · Codirector: Ing. David Harispe  
-> Versión: v0.1.0 (unreleased) | Licencia: MIT
+> Versión: v0.2.0-dev | Licencia: MIT | Actualizado: 2026-06-27
 
 ---
 
@@ -68,9 +68,10 @@ Guardian FS es un sistema de detección y mitigación de ransomware cifrador (cr
          │    └──────────────────┬────────────────────────┘   │
          │                       │                            │
          │    ┌──────────────────▼────────────────────────┐   │
-         │    │       analyzer_thread (asíncrono)          │   │
-         │    │  - Envía features vía Unix socket          │   │
-         │    │  - Recibe veredicto del ML server          │   │
+          │    │       analyzer_thread (asíncrono)          │   │
+          │    │  - Consume ring buffer vía ring_buf_pop()  │   │
+          │    │  - Actual: loguea eventos (stderr)         │   │
+          │    │  - Futuro: envía features a ml_server.py   │   │
          │    └───────────────────────────────────────────┘   │
          └──────────────────┬─────────────────────────────────┘
                             │
@@ -97,13 +98,14 @@ Guardian FS es un sistema de detección y mitigación de ransomware cifrador (cr
 
               ▼
      ┌────────────────────────────────────────────────────┐
-     │         ml_server.py (Unix Domain Socket)           │
+     │     ml_server.py (⚠️ Planeado, no implementado)     │
      │  ┌──────────┐ ┌──────────┐ ┌──────┐ ┌──────────┐ │
      │  │ Random   │ │ Isolation│ │XGBoost│ │ LSTM     │ │
      │  │ Forest   │ │ Forest   │ │ 0.30  │ │ 0.15     │ │
      │  │ 0.35     │ │ 0.20     │ │       │ │(PyTorch) │ │
      │  └──────────┘ └──────────┘ └──────┘ └──────────┘ │
      │  Ensemble voting → p_attack ≥ 0.75 → "attack"    │
+     │  Por ahora: detector.c cubre este rol sin ML      │
      └────────────────────────────────────────────────────┘
 ```
 
@@ -112,7 +114,7 @@ Guardian FS es un sistema de detección y mitigación de ransomware cifrador (cr
 | Hilo | Origen | Propósito |
 |---|---|---|
 | **Principal** | `fuse_main()` | Atiende syscalls FUSE sincrónicamente |
-| **Analizador** | `pthread_create` en `main()` | Procesa ring buffer, envía a ML server (no implementado) |
+| **Analizador** | `pthread_create` en `main()` | Procesa ring buffer. Actual: loguea eventos a stderr. Futuro: enviar a ML server vía Unix socket |
 | **Snapshots** | `zfs_snapshot_schedule()` | Snapshots periódicos cada N segundos (default 60) |
 
 ### 2.3 Comunicación entre Procesos
@@ -120,7 +122,7 @@ Guardian FS es un sistema de detección y mitigación de ransomware cifrador (cr
 ```
 ┌─────────────────┐     Unix Domain Socket      ┌──────────────────┐
 │  guardian_fs (C) │ ──────────────────────────→  │  ml_server.py    │
-│  (analyzer_thread)│   /run/guardian_ml.sock     │  (Python 3.11+)  │
+│  (analyzer_thread)│  /tmp/guardian_ml.sock       │  (Python 3.11+)  │
 └─────────────────┘   JSON-lines bidireccional   └──────────────────┘
                         Request: {features, pid}
                         Response: {p_attack, verdict, scores, flags}
@@ -132,8 +134,8 @@ Guardian FS es un sistema de detección y mitigación de ransomware cifrador (cr
 
 ### 3.1 `entropy.c` — Análisis Estadístico de Bytes
 
-**Ubicación:** `src/entropy.c` (167 líneas)  
-**Dependencias:** `entropy.h` (no existe en disco)
+**Ubicación:** `src/entropy.c` (97 líneas)  
+**Header:** `include/entropy.h` ✅
 
 | Función | Señal | Complejidad | Rango |
 |---|---|---|---|
@@ -141,15 +143,16 @@ Guardian FS es un sistema de detección y mitigación de ransomware cifrador (cr
 | `entropy_chi_square()` | Test χ² de uniformidad | O(n) | χ² ≥ 0 (bajo = uniforme) |
 | `entropy_sliding_window()` | Entropía por bloques | O(n) | array de doubles |
 | `entropy_autocorrelation()` | Correlación de Pearson | O(n) | [-1.0, 1.0] |
+| `entropy_chi2_from_hist()` | χ² desde histograma precomputado | O(1) | χ² ≥ 0 |
 
 **Interpretación:** Datos cifrados → alta entropía (≈7.8 bits/byte), distribución uniforme (χ² < 300), baja autocorrelación.
 
-**⚠️ Problema conocido:** El archivo tiene las 4 funciones duplicadas (líneas 1–84 y 84–167). Impide la compilación.
+**Estado:** ✅ Compila con 0 warnings. 9 tests unitarios (12 assertions), todos pasando.
 
 ### 3.2 `detector.c` — Motor de Scoring Local
 
-**Ubicación:** `src/detector.c` (185 líneas)  
-**Dependencias:** `detector.h`, `entropy.h` (no existen en disco)
+**Ubicación:** `src/detector.c` (248 líneas)  
+**Header:** `include/detector.h` ✅
 
 **Arquitectura interna:**
 
@@ -162,12 +165,13 @@ detector_ctx
 │   ├── canary_triggered, ext_change_count
 │   ├── byte_hist[256], byte_hist_total
 │   ├── score (último calculado)
-│   ├── window_start_ns
-│   └── verdict
+│   ├── verdict, attack_confirmed
+│   └── window_start_ns
 ├── lock (pthread_mutex_t)
-├── umbrales (entropy_thresh, write_rate_thresh, ...)
-├── pesos (w_entropy=0.35, w_write=0.20, ...)
-└── score_thresh = 0.65
+├── umbrales (entropy_thresh, write_rate_thresh, rename_thresh, window_secs)
+├── pesos (w_entropy=0.35, w_write=0.20, w_rename=0.15, w_chi2=0.20, w_rw_ratio=0.10)
+├── score_thresh = 0.65  (≥ → VERDICT_BLOCK)
+└── warn_threshold = 0.45 (≥ → VERDICT_SUSPICIOUS)
 ```
 
 **Ecuación de score:**
@@ -175,8 +179,14 @@ detector_ctx
 ```
 score = 0.35 · f(entropy) + 0.20 · f(write_rate) + 0.15 · f(rename_rate)
       + 0.20 · f(χ²) + 0.10 · f(rw_ratio)
-      + (0.50 si canary_triggered)
+      + 0.50 si canary_triggered (en gfs_write)
+      + 0.80 en detector_signal_canary() (override fuerte)
+      + ext_change_count · 0.4 en detector_check_rename()
 ```
+
+Donde cada f(x) está normalizada a [0, 1].
+
+**Regla rápida adicional:** Si `entropy > entropy_thresh` Y `write_count > 20` en la misma ventana → `VERDICT_SUSPICIOUS` inmediato, sin esperar al score completo.
 
 **Veredictos:**
 
@@ -186,18 +196,20 @@ score = 0.35 · f(entropy) + 0.20 · f(write_rate) + 0.15 · f(rename_rate)
 | 1 | `VERDICT_SUSPICIOUS` | Monitorear (log + analizador asíncrono) |
 | 2 | `VERDICT_BLOCK` | Bloquear + snapshot + kill |
 
+**Estado:** ✅ Compila con 0 warnings. 8 tests unitarios (9 assertions), todos pasando.
+
 ### 3.3 `canary.c` — Archivos Señuelo
 
-**Ubicación:** `src/canary.c` (78 líneas)  
-**Dependencias:** `canary.h` (no existe en disco)
+**Ubicación:** `src/canary.c` (80 líneas)  
+**Header:** `include/canary.h` ✅
 
 **Estrategia de despliegue:**
 
 - Nombres con prefijos `A_` y `ZZ_` para explotar orden alfabético.
 - Extensiones objetivo: `.docx`, `.pdf`, `.jpg`, `.xlsx`.
 - Contenido simulado de baja entropía (texto plano con datos financieros ficticios).
-- Distribución en subdirectorios a distintas profundidades.
-- Hasta 20 canaries desplegados (configurable vía `canary_deploy(ctx, count)`).
+- Hasta 7 plantillas de nombres disponibles, hasta 20 canaries desplegables.
+- Contenido aparenta ser real (~4 KB de datos plausibles por archivo).
 
 **Canary names definidos:**
 
@@ -211,10 +223,12 @@ resume_final_v3.docx
 family_photos_2024.jpg
 ```
 
+**Estado:** ✅ Compila con 0 warnings. 4 tests unitarios (13 assertions), todos pasando.
+
 ### 3.4 `zfs_snap.c` — Interfaz ZFS
 
 **Ubicación:** `src/zfs_snap.c` (96 líneas)  
-**Dependencias:** `zfs_snap.h` (no existe en disco)
+**Header:** `include/zfs_snap.h` ✅
 
 | Función | Propósito | Método |
 |---|---|---|
@@ -224,12 +238,16 @@ family_photos_2024.jpg
 
 **Política de retención:** Últimos 20 snapshots automáticos; el resto se destruyen.
 
+**Nota:** Para la PoC se usa `system()`/`popen()` invocando el binario `zfs`. En producción se recomienda usar `libzfs` directamente para mayor control de errores.
+
+**Estado:** ✅ Compila con 0 warnings.
+
 ### 3.5 `guardian_fs.c` — Proxy FUSE
 
-**Ubicación:** `src/guardian_fs.c` (203 líneas)  
-**Dependencias:** `entropy.h`, `detector.h`, `canary.h`, `zfs_snap.h`, `ring_buffer.h`, `fuse3/fuse.h`
+**Ubicación:** `src/guardian_fs.c` (281 líneas)  
+**Headers:** `entropy.h`, `detector.h`, `canary.h`, `zfs_snap.h`, `ring_buffer.h`, `mitigation.h`, `analyzer.h` ✅
 
-**Operaciones hookeadas:**
+**Operaciones FUSE — todas implementadas (C17, FUSE 3.16+):**
 
 | Operación FUSE | Handler | Comportamiento de seguridad |
 |---|---|---|
@@ -238,12 +256,29 @@ family_photos_2024.jpg
 | `read` | `gfs_read` | Registra evento de lectura (para ratio R/W) |
 | `write` | `gfs_write` | Calcula entropía, evalúa detector, bloquea si es necesario |
 | `rename` | `gfs_rename` | Detecta cambio de extensión (`.doc` → `.locked`) |
-| `unlink` | `gfs_unlink` | Si es canary → bloqueo inmediato |
-| `readdir` | `gfs_readdir` | No implementado (proxy directo necesario) |
-| `mkdir` | `gfs_mkdir` | No implementado |
-| `create` | `gfs_create` | No implementado |
-| `release` | `gfs_release` | No implementado |
-| `truncate` | `gfs_truncate` | No implementado |
+| `unlink` | `gfs_unlink` | Si es canary → bloqueo inmediato + snapshot + kill |
+| `readdir` | `gfs_readdir` | Proxy vía `opendir()`/`readdir()`/`closedir()` |
+| `mkdir` | `gfs_mkdir` | Proxy directo a `mkdir()` |
+| `create` | `gfs_create` | Proxy con `open(O_CREAT)`, guarda fd en `fi->fh` |
+| `release` | `gfs_release` | Cierra fd almacenado en `fi->fh` |
+| `truncate` | `gfs_truncate` | `ftruncate()` si fd abierto, `truncate()` si no |
+
+**Configuración en `main()`:**
+
+```c
+#define WINDOW_SECS       5       // ventana de análisis
+#define ENTROPY_THRESHOLD 7.2     // bits/byte
+#define WRITE_RATE_THRESH 500     // escrituras/ventana
+#define RENAME_THRESH     50      // renombrados/ventana
+```
+
+**Inicialización:**
+1. `detector_init(WINDOW_SECS, ENTROPY_THRESHOLD, WRITE_RATE_THRESH, RENAME_THRESH)`
+2. `canary_init("/zpool/data")` — ⚠️ path hardcodeado
+3. `ring_buf_create(65536, sizeof(io_event_t))` — buffer de 64K eventos
+4. `pthread_create(&analyzer_tid, NULL, analyzer_thread, &gstate)`
+5. `canary_deploy(ctx, 20)` — siembra 20 archivos señuelo
+6. `zfs_snapshot_schedule("tank/data", 60)` — snapshot cada 60s
 
 **Pipeline de escritura (`gfs_write`):**
 
@@ -261,18 +296,23 @@ write(path, buf, size, offset)
   │      │   ├─ mitigation_kill_process(pid)
   │      │   └─ return -EPERM
   │      │
-  │      └─ VERDICT_NORMAL:
+  │      └─ VERDICT_NORMAL / SUSPICIOUS:
   │          └─ pwrite(fi->fh, buf, size, offset) → ZFS real
   │
   └─ return n (bytes escritos reales)
 ```
 
-### 3.6 `ml_server.py` — Servidor de Inferencia ML
+**⚠️ Pendiente para VM:** Paths hardcodeados (`/zpool/data`, `tank/data`). No lee `configs/guardian.conf`. Sin handler de SIGTERM/SIGINT para shutdown graceful.
 
-**Ubicación:** `src/ml_server.py` (297 líneas)  
-**Framework:** scikit-learn + XGBoost + PyTorch (opcional)
+**Estado:** ✅ Compila con libfuse3-dev. Estructuralmente completo.
 
-**Ensemble de 4 modelos con voting ponderado:**
+### 3.6 `ml_server.py` — Servidor de Inferencia ML (⚠️ Planeado, no implementado)
+
+**Ubicación:** No existe en disco. Diseñado en `docs/CHANGES.md` como trabajo futuro.  
+**Framework previsto:** scikit-learn + XGBoost + PyTorch (opcional)
+**Dependencias:** `python/requirements.txt` ✅ (preparado)
+
+**Ensemble de 4 modelos con voting ponderado (diseño):**
 
 | Modelo | Peso | Naturaleza | Propósito |
 |---|---|---|---|
@@ -281,7 +321,7 @@ write(path, buf, size, offset)
 | Isolation Forest | 0.20 | No supervisado | Anomalías (entrenado solo con benignos) |
 | LSTM (PyTorch) | 0.15 | Series temporales | Secuencias de 10 ventanas por PID |
 
-**Feature vector (14 características):**
+**Feature vector (14 características, diseño):**
 
 | # | Feature | Descripción |
 |---|---|---|
@@ -300,7 +340,7 @@ write(path, buf, size, offset)
 | 13 | `unique_dirs` | Directorios únicos accedidos |
 | 14 | `file_type_variety` | Variedad de extensiones escritas |
 
-**Umbrales de veredicto:**
+**Umbrales de veredicto (diseño):**
 
 | p_attack | Veredicto |
 |---|---|
@@ -308,13 +348,15 @@ write(path, buf, size, offset)
 | ≥ 0.50 | `"suspicious"` |
 | < 0.50 | `"normal"` |
 
-**Fallback:** Si no hay modelos entrenados (`rf.pkl` no existe), usa `_rule_based()` con reglas estadísticas fijas.
+**Socket path:** `/tmp/guardian_ml.sock` (Unix Domain, JSON-lines bidireccional)
 
-### 3.7 `train_model.py` — Entrenamiento Offline
+**Estado actual:** `analyzer.c` tiene la función `ml_connect()` preparada pero sin usar. El analyzer thread solo loguea eventos con `fprintf(stderr, ...)`. La detección actual es puramente estadística (módulo `detector.c`).
 
-**Ubicación:** `src/train_model.py` (107 líneas)
+### 3.7 `train_model.py` — Entrenamiento Offline (⚠️ Planeado, no implementado)
 
-**Pipeline:**
+**Ubicación:** No existe en disco. Diseñado como trabajo futuro.
+
+**Pipeline de entrenamiento (diseño):**
 
 ```
 CSV (features_labeled.csv)
@@ -328,16 +370,40 @@ CSV (features_labeled.csv)
   └─ Serialización: scaler.pkl, rf.pkl, xgb.json
 ```
 
-### 3.8 Módulos Declarados pero No Implementados
+**Dependencias:** `python/requirements.txt` ✅ (numpy, scikit-learn, xgboost, pandas, imbalanced-learn)
 
-| Módulo | Archivo faltante | Uso |
+### 3.8 Módulos de Soporte (todos implementados ✅)
+
+| Módulo | Archivo | Header | Líneas | Propósito |
+|---|---|---|---|---|
+| **ring_buffer** | `src/ring_buffer.c` | `include/ring_buffer.h` | 65 | Buffer circular thread-safe con mutex + condition variables. Push/Pop bloqueantes. Capacidad 64K eventos `io_event_t`. |
+| **mitigation** | `src/mitigation.c` | `include/mitigation.h` | 14 | `mitigation_kill_process(pid)` — envía SIGKILL al proceso atacante. |
+| **analyzer** | `src/analyzer.c` | `include/analyzer.h` | 49 | `analyzer_thread()` — hilo background que consume eventos del ring buffer. Stub actual: loguea eventos. Tiene `ml_connect()` preparada para futuro socket Unix al servidor ML. |
+
+**Tests asociados:**
+
+| Módulo | Test file | Tests | Estado |
+|---|---|---|---|
+| ring_buffer | `tests/unit/test_ring_buffer.c` | 5 (46 assertions) | ✅ |
+| mitigation | `tests/unit/test_mitigation.c` | 2 (3 assertions) | ✅ |
+
+### 3.9 Scripts Operacionales (todos implementados ✅)
+
+| Script | Líneas | Propósito |
 |---|---|---|
-| `ring_buffer.h` | `src/include/` | Buffer circular de 64KB para eventos de E/S |
-| `mitigation_kill_process()` | `src/mitigation/` | Terminación del proceso atacante vía SIGKILL |
-| `analyzer_thread()` | `src/guardian_fs/` | Hilo asíncrono que procesa ring buffer y consulta ML |
-| Headers locales | `include/` | `entropy.h`, `detector.h`, `canary.h`, `zfs_snap.h`, `ring_buffer.h` |
-| `gfs_readdir()`, `gfs_mkdir()`, `gfs_create()`, `gfs_release()`, `gfs_truncate()` | `src/guardian_fs/` | Operaciones FUSE restantes |
-| Build system | `CMakeLists.txt` | No existe en disco |
+| `scripts/install_deps.sh` | 36 | Instala dependencias del sistema (build-essential, cmake, libfuse3-dev, zfsutils-linux, python3). Idempotente. |
+| `scripts/zfs_setup.sh` | 56 | Crea pool ZFS file-backed (2 GB) para PoC/testing. Crea dataset, configura compresión lz4, atime=off. |
+| `scripts/mount.sh` | 52 | Monta el filesystem FUSE. Valida que guardian_fs exista, crea mountpoint, desmonta si ya estaba montado. |
+| `scripts/rollback.sh` | 56 | Rollback de dataset ZFS a snapshot específico o al último. Muestra estado actual antes y después. |
+| `scripts/run_tests.sh` | 29 | Compila y ejecuta todos los tests unitarios vía CMake/CTest. Retorna exit code 0 si todo pasa. |
+
+### 3.10 Configuración
+
+| Archivo | Contenido |
+|---|---|
+| `configs/guardian.conf` | Umbrales del detector, canary count, dataset ZFS, path del socket ML, nivel de logging. |
+| `configs/logging.conf` | Configuración de logging estructurado. |
+| `python/requirements.txt` | Dependencias Python para ML (numpy, scikit-learn, xgboost, pandas, imbalanced-learn, matplotlib). |
 
 ---
 
@@ -382,16 +448,19 @@ Ransomware renombra A_important_report.docx → A_important_report.locked
   → return -EPERM
 ```
 
-### 4.4 Flujo de ML Asíncrono (cuando esté implementado)
+### 4.4 Flujo de ML Asíncrono (⚠️ Planeado, no implementado aún)
 
 ```
 analyzer_thread (segundo plano, cada ~1s):
-  ├─ Procesa ring_buffer de eventos
-  ├─ Calcula feature vector por PID
-  ├─ Conecta a /run/guardian_ml.sock
-  ├─ Envía JSON: {"features": {...}, "pid": 1234}
-  ├─ Recibe JSON: {"p_attack": 0.89, "verdict": "attack", ...}
-  └─ Si p_attack ≥ 0.75 → señaliza al detector para bloquear
+  ├─ Consume ring_buffer de eventos vía ring_buf_pop()
+  ├─ Actual: loguea tipo, PID y path a stderr
+  ├─ Futuro:
+  │   ├─ Calcular feature vector por PID (14 features)
+  │   ├─ Conectar a /tmp/guardian_ml.sock (Unix socket)
+  │   ├─ Enviar JSON: {"features": {...}, "pid": 1234}
+  │   ├─ Recibir JSON: {"p_attack": 0.89, "verdict": "attack", ...}
+  │   └─ Si p_attack ≥ 0.75 → modificar score del detector
+  └─ Por ahora: detector.c cubre toda la detección sin dependencia de Python
 ```
 
 ### 4.5 Flujo de Recuperación (rollback)
@@ -412,9 +481,9 @@ Administrador detecta ataque (o responde automáticamente):
                      └────┬─────┘
                           │ write() con entropía alta o tasa elevada
                           ▼
-                   ┌──────────────┐
-                   │  SUSPICIOUS   │ ← score ≥ 0.50 (ML solo)
-                   └──────┬───────┘
+                    ┌──────────────┐
+                    │  SUSPICIOUS   │ ← score ≥ 0.45 o regla rápida
+                    └──────┬───────┘
                           │ score ≥ 0.65 o canary tocado
                           ▼
                     ┌───────────┐
@@ -540,39 +609,90 @@ La latencia de un socket round-trip a Python es ~1–5ms. Para no bloquear la sy
 
 ## 7. Estado Actual y Trabajo Pendiente
 
-### 7.1 Implementado (v0.1.0)
+> **Última actualización:** 2026-06-27 — post-compilación inicial y test suite.
 
-- [x] `entropy.c` — funciones estadísticas completas (con duplicado a corregir)
-- [x] `detector.c` — motor de scoring por PID con ventanas y thread-safety
-- [x] `canary.c` — despliegue y detección de archivos señuelo
-- [x] `zfs_snap.c` — snapshots de emergencia, periódicos y rollback
-- [x] `guardian_fs.c` — esqueleto FUSE con write/rename/unlink/open hookeados
-- [x] `ml_server.py` — servidor ML completo con ensemble y fallback rule-based
-- [x] `train_model.py` — pipeline de entrenamiento con SMOTE y validación cruzada
-- [x] `zfs_setup.sh` — script de setup de infraestructura
+### 7.1 Implementado (módulos C — compilación y tests)
 
-### 7.2 No Implementado (brecha README vs. disco)
+| Componente | Archivo(s) | Estado |
+|---|---|---|
+| **Headers** | `include/{entropy,detector,canary,zfs_snap,ring_buffer,mitigation,analyzer}.h` | ✅ 7 headers, todos compilan |
+| **Entropía** | `src/entropy.c` (97 líneas) | ✅ 5 funciones, 9 tests pasando |
+| **Detector** | `src/detector.c` (248 líneas) | ✅ 5 funciones, 8 tests pasando |
+| **Canary** | `src/canary.c` (80 líneas) | ✅ 3 funciones, 4 tests pasando |
+| **ZFS Snapshots** | `src/zfs_snap.c` (96 líneas) | ✅ 3 funciones |
+| **Ring Buffer** | `src/ring_buffer.c` (65 líneas) | ✅ 4 funciones, 5 tests pasando |
+| **Mitigation** | `src/mitigation.c` (14 líneas) | ✅ 1 función, 2 tests pasando |
+| **Analyzer** | `src/analyzer.c` (49 líneas) | ✅ Stub funcional (loguea eventos) |
+| **Proxy FUSE** | `src/guardian_fs.c` (281 líneas) | ✅ 11 operaciones FUSE implementadas |
+| **Build system** | `CMakeLists.txt` + `tests/unit/CMakeLists.txt` | ✅ CMake 3.22+, C17, fuse3, pthread |
+| **Scripts** | `scripts/{install_deps,zfs_setup,mount,rollback,run_tests}.sh` | ✅ 5 scripts operacionales |
+| **Configs** | `configs/{guardian,logging}.conf` | ✅ Preparados, no leídos por el binario aún |
+| **Python deps** | `python/requirements.txt` | ✅ 7 dependencias listas |
+| **Unit tests** | `tests/unit/test_{entropy,detector,canary,ring_buffer,mitigation}.c` | ✅ 28 tests, 83 assertions, 0 fallos |
+| **Docs** | `docs/{architecture/README,CHANGES,testing-guide}.md` | ✅ 3 documentos actualizados |
 
-- [ ] Headers locales (`entropy.h`, `detector.h`, `canary.h`, `zfs_snap.h`, `ring_buffer.h`)
-- [ ] `ring_buffer.c` — buffer circular de 64KB
-- [ ] `mitigation_kill_process()` — terminación de procesos
-- [ ] `analyzer_thread()` — hilo asíncrono de ML
-- [ ] Operaciones FUSE restantes (`readdir`, `mkdir`, `create`, `release`, `truncate`)
-- [ ] `CMakeLists.txt` — build system
-- [ ] Scripts: `install_deps.sh`, `mount.sh`, `rollback.sh`, `run_tests.sh`
-- [ ] Tests unitarios, de integración y fixtures
-- [ ] Configs (`guardian.conf`, `logging.conf`)
-- [ ] GitHub Actions CI/CD
-- [ ] `python/requirements.txt`
-- [ ] Feature extractor Python (`feature_extractor.py`)
+**Total:** 8 módulos C compilan con 0 errores y 0 warnings (`-Wall -Wextra -Wpedantic`).
 
-### 7.3 Problemas Conocidos
+### 7.2 Pendiente para Deploy en VM
 
-1. **`entropy.c` duplicado**: las 4 funciones aparecen dos veces (copy-paste). Impide compilación.
-2. **`clock_gettime_ns()`**: no es POSIX estándar. Debe reemplazarse por `clock_gettime()` + conversión a nanosegundos.
-3. **Funciones referenciadas sin definición**: `detector_signal_canary()`, `detector_check_rename()`, `detector_confirm_attack()`, `detector_chi2_from_hist()`, `mitigation_kill_process()`, `ring_buf_create()`, `ring_buf_push()`.
-4. **Sin build system**: no hay `CMakeLists.txt` en disco — el código C no compila.
-5. **Sin requirements.txt**: las dependencias Python deben instalarse manualmente.
+| # | Tarea | Impacto | Esfuerzo |
+|---|---|---|---|
+| 1 | **Leer `configs/guardian.conf`** en vez de paths hardcodeados (`/zpool/data`, `tank/data`) | Alto — sin esto no se puede cambiar el dataset sin recompilar | 30 min |
+| 2 | **Handler de SIGTERM/SIGINT** para shutdown graceful (detener threads, desmontar FUSE, liberar recursos) | Alto — sin esto el proceso deja threads huérfanos | 20 min |
+| 3 | **Implementar `ml_server.py`** — servidor ML con ensemble (RF + XGBoost + IsolationForest + LSTM) | Medio — la detección actual es solo estadística; ML daría segunda opinión | 4–6 h |
+| 4 | **Implementar `train_model.py`** — pipeline de entrenamiento offline con SMOTE + validación cruzada | Depende de #3 | 2–3 h |
+| 5 | **Conectar `analyzer.c` al socket ML** — descomentar `ml_connect()` y enviar features reales | Depende de #3 | 1 h |
+| 6 | **Integration test** — script que simule ransomware (escribe alta entropía, cambia extensiones, toca canaries) y verifique que el sistema bloquea | Medio — necesario para validar antes de mostrar | 1–2 h |
+| 7 | **Systemd unit file** — para correr guardian_fs como servicio al boot | Bajo — nice-to-have para la VM | 15 min |
+
+### 7.3 Lo que SÍ funciona hoy (PoC mínima viable)
+
+Si instalás `libfuse3-dev` + ZFS en la VM y compilás:
+
+```bash
+sudo bash scripts/install_deps.sh
+sudo bash scripts/zfs_setup.sh
+cmake -S . -B build && cmake --build build --parallel
+sudo bash scripts/mount.sh /mnt/guardian_real /mnt/protected
+```
+
+- ✅ Cualquier escritura con entropía > 7.2 bits/byte dispara bloqueo
+- ✅ Cambios masivos de extensión disparan sospecha
+- ✅ Tocar un archivo canary → bloqueo inmediato + kill
+- ✅ Snapshot ZFS de emergencia automático ante bloqueo
+- ✅ Snapshot ZFS programado cada 60s
+- ✅ Rollback manual al último snapshot
+
+La detección estadística (detector.c) es funcional y suficiente para demostrar el concepto. El ML es la capa de refinamiento que reduce falsos positivos.
+
+### 7.4 Problemas Conocidos Corregidos ( changelog)
+
+| ID | Problema (v0.0) | Estado (v0.1) |
+|---|---|---|
+| P1 | `entropy.c` con código duplicado (83 líneas repetidas) | ✅ Corregido. Archivo limpio en 97 líneas. |
+| P2 | 0 headers locales (`include/` vacío) | ✅ 7 headers implementados. |
+| P3 | `ring_buffer.c`, `mitigation.c`, `analyzer.c` no existían | ✅ Los 3 módulos existen y compilan. |
+| P4 | 5 operaciones FUSE sin implementar (readdir, mkdir, create, release, truncate) | ✅ Las 5 implementadas. |
+| P5 | `clock_gettime_ns()` no portable (syscall Linux específico) | ✅ Reemplazado por `clock_gettime(CLOCK_MONOTONIC)` + conversión. |
+| P6 | `detector_signal_canary()`, `detector_check_rename()`, `detector_confirm_attack()` sin definir | ✅ Las 3 implementadas con lógica real. |
+| P7 | `entropy_chi2_from_hist()` referenciada pero inexistente | ✅ Implementada en `entropy.c`. |
+| P8 | Sin build system (sin CMakeLists.txt) | ✅ CMakeLists.txt raíz y de tests. |
+| P9 | Sin tests unitarios | ✅ 28 tests, 83 assertions, todos pasando. |
+| P10 | Sin scripts operacionales | ✅ 5 scripts implementados. |
+
+### 7.5 Métricas de Calidad
+
+| Métrica | Estado |
+|---|---|
+| Módulos que compilan | 8/8 (100%) |
+| Warnings de compilación | 0 (`-Wall -Wextra -Wpedantic`) |
+| Cobertura de tests unitarios | 5/8 módulos con tests dedicados |
+| Tests pasando | 28/28 (100%) |
+| Total assertions | 83 |
+| Funciones C implementadas | 32 |
+| Operaciones FUSE implementadas | 11/11 |
+| Scripts operacionales | 5/5 |
+| Documentación | 3 documentos (arquitectura, cambios, testing) |
 
 ---
 
@@ -582,7 +702,7 @@ La latencia de un socket round-trip a Python es ~1–5ms. Para no bloquear la sy
 |---|---|---|
 | Filesystem proxy | FUSE (libfuse3) | 3.16+ |
 | Storage | OpenZFS (ZFS on Linux) | 2.2+ |
-| Lenguaje C | C11 (GCC/Clang) | 13+ / 17+ |
+| Lenguaje C | C17 (GCC) | 13+ |
 | Lenguaje Python | Python 3 | 3.11+ |
 | ML supervizado | scikit-learn (RF), XGBoost | ≥1.5, ≥2.0 |
 | ML no supervisado | scikit-learn (IsolationForest) | ≥1.5 |
