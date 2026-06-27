@@ -1,8 +1,19 @@
+#define _GNU_SOURCE
+#include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
+#include <time.h>
+#include <math.h>
 #include <pthread.h>
 #include "detector.h"
 #include "entropy.h"
+
+static inline uint64_t clock_gettime_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 /* Estado por proceso */
 typedef struct {
@@ -24,6 +35,7 @@ typedef struct {
     uint64_t  byte_hist[256];
     uint64_t  byte_hist_total;
     int       verdict;           /* VERDICT_NORMAL / BLOCK        */
+    int       attack_confirmed;  /* set by detector_confirm_attack */
 } pid_state_t;
 
 struct detector_ctx {
@@ -42,6 +54,7 @@ struct detector_ctx {
     double w_chi2;       /* peso test χ²            */
     double w_rw_ratio;   /* peso ratio read/write   */
     double score_thresh; /* umbral score → bloqueo  */
+    double warn_threshold; /* umbral score → sospechoso */
 };
 
 struct detector_ctx *detector_init(uint32_t window_secs,
@@ -60,6 +73,7 @@ struct detector_ctx *detector_init(uint32_t window_secs,
     ctx->w_chi2      = 0.20;
     ctx->w_rw_ratio  = 0.10;
     ctx->score_thresh= 0.65;   /* 65% → alerta */
+    ctx->warn_threshold = 0.45; /* 45% → sospechoso */
     pthread_mutex_init(&ctx->lock, NULL);
     return ctx;
 }
@@ -154,6 +168,7 @@ static double compute_score(struct detector_ctx *ctx, pid_state_t *s) {
 
 int detector_check_write(struct detector_ctx *ctx, uint32_t pid,
                           const char *path, double entropy, size_t size) {
+    (void)path;
     pthread_mutex_lock(&ctx->lock);
     pid_state_t *s = get_or_create_pid(ctx, pid);
     maybe_rotate_window(ctx, s);
@@ -182,4 +197,52 @@ int detector_check_write(struct detector_ctx *ctx, uint32_t pid,
 
     pthread_mutex_unlock(&ctx->lock);
     return verdict;
+}
+
+void detector_signal_canary(struct detector_ctx *ctx, const char *path,
+                            uint32_t pid) {
+    pthread_mutex_lock(&ctx->lock);
+    pid_state_t *s = get_or_create_pid(ctx, pid);
+    s->canary_triggered = 1;
+    s->score += 0.8;  /* Heavy weight for canary access */
+    if (s->score > 1.0) s->score = 1.0;
+    fprintf(stderr, "[detector] CANARY ALERT: path=%s pid=%u\n", path, pid);
+    pthread_mutex_unlock(&ctx->lock);
+}
+
+int detector_check_rename(struct detector_ctx *ctx, uint32_t pid,
+                          const char *from, const char *to, int ext_changed) {
+    (void)from;
+    (void)to;
+    pthread_mutex_lock(&ctx->lock);
+    pid_state_t *s = get_or_create_pid(ctx, pid);
+    maybe_rotate_window(ctx, s);
+
+    s->rename_count++;
+    if (ext_changed) {
+        s->ext_change_count++;
+    }
+
+    double score = compute_score(ctx, s);
+    /* Extension changes are a strong signal: each adds 0.4 to aggregate */
+    score += s->ext_change_count * 0.4;
+    if (score > 1.0) score = 1.0;
+    s->score = score;
+
+    int verdict = VERDICT_NORMAL;
+    if (score >= ctx->score_thresh)
+        verdict = VERDICT_BLOCK;
+    else if (score >= ctx->warn_threshold)
+        verdict = VERDICT_SUSPICIOUS;
+
+    pthread_mutex_unlock(&ctx->lock);
+    return verdict;
+}
+
+void detector_confirm_attack(struct detector_ctx *ctx, uint32_t pid) {
+    pthread_mutex_lock(&ctx->lock);
+    pid_state_t *s = get_or_create_pid(ctx, pid);
+    s->attack_confirmed = 1;
+    fprintf(stderr, "[detector] ATTACK CONFIRMED for PID=%u\n", pid);
+    pthread_mutex_unlock(&ctx->lock);
 }

@@ -27,7 +27,7 @@ Universidad Tecnológica Nacional — Facultad Regional Santa Fe
 
 ## Descripción
 
-**Guardian FS** es una Prueba de Concepto (PoC) que implementa un sistema de detección y recuperación de datos frente a ataques de *cryptoware* (ransomware cifrador) en sistemas Linux. Combina dos tecnologías complementarias:
+**Guardian FS** Sistema de detección y recuperación de datos frente a ataques de *cryptoware* (ransomware cifrador) en sistemas Linux. Combina dos tecnologías complementarias:
 
 - **FUSE (Filesystem in UserSpace)**: intercepción sincrónica de operaciones de E/S para detección temprana mediante análisis estadístico y modelos de aprendizaje automático.
 - **ZFS (Zettabyte File System)**: recuperación de datos mediante snapshots inmutables basados en el paradigma Copy-on-Write (CoW).

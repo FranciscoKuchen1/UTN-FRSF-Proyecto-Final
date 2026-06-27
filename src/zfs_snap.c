@@ -1,5 +1,9 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdint.h>
 #include <time.h>
 #include <pthread.h>
 #include "zfs_snap.h"
@@ -29,11 +33,7 @@ int zfs_snapshot_emergency(const char *dataset) {
 }
 
 /* Snapshot periódico programado */
-typedef struct {
-    char    *dataset;
-    uint32_t interval_secs;
-    volatile int running;
-} snap_thread_arg_t;
+/* snap_thread_arg_t is defined in zfs_snap.h — use that */
 
 static void *snapshot_scheduler(void *arg) {
     snap_thread_arg_t *a = arg;
