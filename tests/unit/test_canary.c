@@ -4,7 +4,9 @@
  *
  * Uses mkdtemp() for temporary directories. No root or filesystem privileges needed.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

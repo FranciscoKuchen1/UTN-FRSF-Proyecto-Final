@@ -25,7 +25,7 @@ try:
 except ImportError:
     LSTM_AVAILABLE = False
 
-SOCKET_PATH = "/run/guardian_ml.sock"
+SOCKET_PATH = "/tmp/guardian_ml.sock"
 MODEL_DIR   = Path("/var/lib/guardian/models")
 
 class FeatureVector:

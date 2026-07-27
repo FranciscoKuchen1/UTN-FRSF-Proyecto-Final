@@ -8,6 +8,7 @@ add_library(guardian_obj OBJECT
     ${CMAKE_SOURCE_DIR}/src/canary.c
     ${CMAKE_SOURCE_DIR}/src/ring_buffer.c
     ${CMAKE_SOURCE_DIR}/src/mitigation.c
+    ${CMAKE_SOURCE_DIR}/src/analyzer.c
 )
 
 target_include_directories(guardian_obj PRIVATE ${CMAKE_SOURCE_DIR}/include)

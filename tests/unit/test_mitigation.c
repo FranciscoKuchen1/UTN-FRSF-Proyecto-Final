@@ -5,7 +5,9 @@
  * Tests that the module links and handles edge cases without crashing.
  * We do NOT test killing real processes.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

@@ -4,7 +4,9 @@
  *
  * Tests behavior through the public API only (detector_ctx is opaque).
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

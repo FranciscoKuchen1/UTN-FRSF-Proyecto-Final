@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -47,6 +49,20 @@ int ring_buf_pop(struct ring_buf *rb, io_event_t *ev) {
     pthread_mutex_lock(&rb->lock);
     while (rb->count == 0)
         pthread_cond_wait(&rb->not_empty, &rb->lock);
+    memcpy(ev, &rb->events[rb->tail], sizeof(io_event_t));
+    rb->tail = (rb->tail + 1) % rb->capacity;
+    rb->count--;
+    pthread_cond_signal(&rb->not_full);
+    pthread_mutex_unlock(&rb->lock);
+    return 0;
+}
+
+int ring_buf_try_pop(struct ring_buf *rb, io_event_t *ev) {
+    pthread_mutex_lock(&rb->lock);
+    if (rb->count == 0) {
+        pthread_mutex_unlock(&rb->lock);
+        return -1;
+    }
     memcpy(ev, &rb->events[rb->tail], sizeof(io_event_t));
     rb->tail = (rb->tail + 1) % rb->capacity;
     rb->count--;

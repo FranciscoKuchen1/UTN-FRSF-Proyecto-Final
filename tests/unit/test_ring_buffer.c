@@ -5,7 +5,9 @@
  * Tests use non-blocking paths only (push when not full, pop when not empty).
  * Blocking behavior (push on full, pop on empty) is not tested here.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

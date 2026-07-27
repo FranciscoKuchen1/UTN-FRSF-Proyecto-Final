@@ -1,7 +1,9 @@
 /* test_entropy.c — Unit tests for entropy module
  * Compile with: gcc -std=c17 -Wall -Wextra test_entropy.c ../src/entropy.c -I../include -lm -o test_entropy
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

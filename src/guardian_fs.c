@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #define FUSE_USE_VERSION 35
 #include <fuse3/fuse.h>
 #include <fuse3/fuse_lowlevel.h>
@@ -23,10 +25,55 @@
 #include "mitigation.h"
 #include "analyzer.h"
 
+/* ── Logging estructurado ── */
+#define LOG_PATH_DEFAULT "/var/log/guardian/events.jsonl"
+
+static FILE  *log_fp = NULL;
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void log_init(void) {
+    const char *path = getenv("GUARDIAN_LOG_PATH");
+    if (!path) path = LOG_PATH_DEFAULT;
+    log_fp = fopen(path, "a");
+    if (!log_fp) {
+        /* fallback: stderr si no se puede abrir el archivo */
+        log_fp = stderr;
+    } else {
+        setvbuf(log_fp, NULL, _IONBF, 0);  /* sin buffering para inmediatez */
+    }
+}
+
+static void log_event(const char *event_type, uint32_t pid,
+                      const char *path, const char *extra_json) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    char ts_buf[32];
+    strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%dT%H:%M:%S",
+             gmtime(&ts.tv_sec));
+
+    pthread_mutex_lock(&log_mutex);
+    if (log_fp) {
+        fprintf(log_fp,
+                "{\"ts\":\"%s.%09ld\",\"event\":\"%s\",\"pid\":%u,"
+                "\"path\":\"%s\"%s%s}\n",
+                ts_buf, ts.tv_nsec,
+                event_type, pid, path,
+                extra_json ? "," : "", extra_json ? extra_json : "");
+        fflush(log_fp);
+    }
+    pthread_mutex_unlock(&log_mutex);
+}
+
 static inline uint64_t clock_gettime_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* ── Helper: env var con fallback ── */
+static char *get_env_or(const char *name, const char *fallback) {
+    const char *val = getenv(name);
+    return strdup(val ? val : fallback);
 }
 
 /* ── Configuración global ── */
@@ -75,8 +122,10 @@ static int gfs_open(const char *path, struct fuse_file_info *fi) {
 
     /* Detectar apertura de canary */
     if (canary_is_canary(gstate.can, path)) {
-        detector_signal_canary(gstate.det, path,
-                               fuse_get_context()->pid);
+        uint32_t pid = fuse_get_context()->pid;
+        log_event("canary_accessed", pid, path,
+                  "\"verdict\":\"SUSPICIOUS\"");
+        detector_signal_canary(gstate.det, path, pid);
     }
     return 0;
 }
@@ -122,6 +171,11 @@ static int gfs_write(const char *path, const char *buf, size_t size,
     /* 3. Evaluación sincrónica rápida (umbrales locales por proceso) */
     int verdict = detector_check_write(gstate.det, pid, path, ent, size);
     if (verdict == VERDICT_BLOCK) {
+        char extra[128];
+        snprintf(extra, sizeof(extra),
+                 "\"entropy\":%.4f,\"size\":%zu,\"verdict\":\"BLOCK\"",
+                 ent, size);
+        log_event("write_blocked", pid, path, extra);
         /* Bloquear escritura y disparar snapshot de emergencia */
         zfs_snapshot_emergency(gstate.zfs_dataset);
         mitigation_kill_process(pid);
@@ -156,6 +210,12 @@ static int gfs_rename(const char *from, const char *to, unsigned int flags) {
 
     if (detector_check_rename(gstate.det, pid, from, to, ext_changed)
             == VERDICT_BLOCK) {
+        char extra[128];
+        snprintf(extra, sizeof(extra),
+                 "\"from\":\"%s\",\"to\":\"%s\",\"ext_changed\":%d,"
+                 "\"verdict\":\"BLOCK\"",
+                 from, to, ext_changed);
+        log_event("rename_blocked", pid, from, extra);
         zfs_snapshot_emergency(gstate.zfs_dataset);
         mitigation_kill_process(pid);
         return -EPERM;
@@ -169,6 +229,8 @@ static int gfs_unlink(const char *path) {
 
     if (canary_is_canary(gstate.can, path)) {
         /* Eliminación de canary = ataque confirmado */
+        log_event("canary_deleted", pid, path,
+                  "\"verdict\":\"ATTACK_CONFIRMED\"");
         zfs_snapshot_emergency(gstate.zfs_dataset);
         detector_confirm_attack(gstate.det, pid);
         mitigation_kill_process(pid);
@@ -189,6 +251,7 @@ static int gfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                        off_t offset, struct fuse_file_info *fi,
                        enum fuse_readdir_flags flags) {
     (void)offset;
+    (void)fi;
     (void)flags;
     char rpath[PATH_MAX];
     real_path(rpath, path);
@@ -259,8 +322,12 @@ static const struct fuse_operations guardian_ops = {
 
 int main(int argc, char *argv[]) {
     /* Inicialización */
-    gstate.real_root   = "/zpool/data";       /* dataset ZFS montado */
-    gstate.zfs_dataset = "tank/data";
+    log_init();
+    gstate.real_root   = get_env_or("GUARDIAN_REAL_ROOT", "/zpool/data");
+    gstate.zfs_dataset = get_env_or("GUARDIAN_ZFS_DATASET", "tank/data");
+    /* NOTE: real_root and zfs_dataset are never freed — this is a
+     * long-running FUSE daemon so the one-time allocation at startup
+     * is negligible and the OS reclaims it on process exit. */
     gstate.det         = detector_init(WINDOW_SECS, ENTROPY_THRESHOLD,
                                        WRITE_RATE_THRESH, RENAME_THRESH);
     gstate.can         = canary_init("/zpool/data");
