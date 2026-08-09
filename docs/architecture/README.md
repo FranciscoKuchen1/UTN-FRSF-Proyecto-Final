@@ -68,10 +68,11 @@ Guardian FS es un sistema de detección y mitigación de ransomware cifrador (cr
          │    └──────────────────┬────────────────────────┘   │
          │                       │                            │
          │    ┌──────────────────▼────────────────────────┐   │
-          │    │       analyzer_thread (asíncrono)          │   │
-          │    │  - Consume ring buffer vía ring_buf_pop()  │   │
-          │    │  - Actual: loguea eventos (stderr)         │   │
-          │    │  - Futuro: envía features a ml_server.py   │   │
+           │    │       analyzer_thread (asíncrono)          │   │
+           │    │  - Consume ring buffer vía ring_buf_try_pop()│  │
+           │    │  - Acumula estadísticas por PID (ventana 5s) │  │
+           │    │  - Conecta a ml_server.py vía Unix socket    │  │
+           │    │  - Reintenta conexión cada 5s si falla       │  │
          │    └───────────────────────────────────────────┘   │
          └──────────────────┬─────────────────────────────────┘
                             │
@@ -90,23 +91,23 @@ Guardian FS es un sistema de detección y mitigación de ransomware cifrador (cr
               ▼
      ┌────────────────────────────────────────────────────┐
      │              ZFS (tank/data)                        │
-     │  - Snapshot periódico cada 60s (@guardian_auto_*)  │
+      │  - Snapshot periódico cada 300s (@guardian_auto_*) │
      │  - Snapshot de emergencia (@guardian_emergency_*)  │
      │  - Rollback al snapshot más reciente                │
      │  - Compresión lz4, checksums sha256, atime off     │
      └────────────────────────────────────────────────────┘
 
-              ▼
-     ┌────────────────────────────────────────────────────┐
-     │     ml_server.py (⚠️ Planeado, no implementado)     │
-     │  ┌──────────┐ ┌──────────┐ ┌──────┐ ┌──────────┐ │
-     │  │ Random   │ │ Isolation│ │XGBoost│ │ LSTM     │ │
-     │  │ Forest   │ │ Forest   │ │ 0.30  │ │ 0.15     │ │
-     │  │ 0.35     │ │ 0.20     │ │       │ │(PyTorch) │ │
-     │  └──────────┘ └──────────┘ └──────┘ └──────────┘ │
-     │  Ensemble voting → p_attack ≥ 0.75 → "attack"    │
-     │  Por ahora: detector.c cubre este rol sin ML      │
-     └────────────────────────────────────────────────────┘
+               ▼
+      ┌────────────────────────────────────────────────────┐
+      │     ml_server.py (Servidor de Inferencia ML)       │
+      │  ┌──────────┐ ┌──────────┐ ┌──────┐ ┌──────────┐ │
+      │  │ Random   │ │ Isolation│ │XGBoost│ │ LSTM     │ │
+      │  │ Forest   │ │ Forest   │ │ 0.30  │ │ 0.15     │ │
+      │  │ 0.35     │ │ 0.20     │ │       │ │(PyTorch) │ │
+      │  └──────────┘ └──────────┘ └──────┘ └──────────┘ │
+      │  Ensemble voting → p_attack ≥ 0.75 → "attack"    │
+      │  Fallback a reglas si no hay modelos entrenados   │
+      └────────────────────────────────────────────────────┘
 ```
 
 ### 2.2 Modelo de Hilos
@@ -114,7 +115,7 @@ Guardian FS es un sistema de detección y mitigación de ransomware cifrador (cr
 | Hilo | Origen | Propósito |
 |---|---|---|
 | **Principal** | `fuse_main()` | Atiende syscalls FUSE sincrónicamente |
-| **Analizador** | `pthread_create` en `main()` | Procesa ring buffer. Actual: loguea eventos a stderr. Futuro: enviar a ML server vía Unix socket |
+| **Analizador** | `pthread_create` en `main()` | Consume ring buffer, acumula stats por PID, envía features a ML server vía Unix socket. Reintenta conexión cada 5s. |
 | **Snapshots** | `zfs_snapshot_schedule()` | Snapshots periódicos cada N segundos (default 60) |
 
 ### 2.3 Comunicación entre Procesos
@@ -244,7 +245,7 @@ family_photos_2024.jpg
 
 ### 3.5 `guardian_fs.c` — Proxy FUSE
 
-**Ubicación:** `src/guardian_fs.c` (281 líneas)  
+**Ubicación:** `src/guardian_fs.c` (348 líneas)  
 **Headers:** `entropy.h`, `detector.h`, `canary.h`, `zfs_snap.h`, `ring_buffer.h`, `mitigation.h`, `analyzer.h` ✅
 
 **Operaciones FUSE — todas implementadas (C17, FUSE 3.16+):**
@@ -306,13 +307,13 @@ write(path, buf, size, offset)
 
 **Estado:** ✅ Compila con libfuse3-dev. Estructuralmente completo.
 
-### 3.6 `ml_server.py` — Servidor de Inferencia ML (⚠️ Planeado, no implementado)
+### 3.6 `ml_server.py` — Servidor de Inferencia ML
 
-**Ubicación:** No existe en disco. Diseñado en `docs/CHANGES.md` como trabajo futuro.  
-**Framework previsto:** scikit-learn + XGBoost + PyTorch (opcional)
-**Dependencias:** `python/requirements.txt` ✅ (preparado)
+**Ubicación:** `src/ml_server.py` (297 líneas)  
+**Framework:** scikit-learn + XGBoost + PyTorch (opcional)  
+**Dependencias:** `python/requirements.txt` ✅
 
-**Ensemble de 4 modelos con voting ponderado (diseño):**
+**Ensemble de 4 modelos con voting ponderado:**
 
 | Modelo | Peso | Naturaleza | Propósito |
 |---|---|---|---|
@@ -321,7 +322,7 @@ write(path, buf, size, offset)
 | Isolation Forest | 0.20 | No supervisado | Anomalías (entrenado solo con benignos) |
 | LSTM (PyTorch) | 0.15 | Series temporales | Secuencias de 10 ventanas por PID |
 
-**Feature vector (14 características, diseño):**
+**Feature vector (14 características):**
 
 | # | Feature | Descripción |
 |---|---|---|
@@ -340,7 +341,7 @@ write(path, buf, size, offset)
 | 13 | `unique_dirs` | Directorios únicos accedidos |
 | 14 | `file_type_variety` | Variedad de extensiones escritas |
 
-**Umbrales de veredicto (diseño):**
+**Umbrales de veredicto:**
 
 | p_attack | Veredicto |
 |---|---|
@@ -350,16 +351,20 @@ write(path, buf, size, offset)
 
 **Socket path:** `/tmp/guardian_ml.sock` (Unix Domain, JSON-lines bidireccional)
 
-**Estado actual:** `analyzer.c` tiene la función `ml_connect()` preparada pero sin usar. El analyzer thread solo loguea eventos con `fprintf(stderr, ...)`. La detección actual es puramente estadística (módulo `detector.c`).
+**Fallback:** Si no hay modelos entrenados en `/var/lib/guardian/models/`, usa reglas estadísticas (`_rule_based()`) que replican la lógica del detector C.
 
-### 3.7 `train_model.py` — Entrenamiento Offline (⚠️ Planeado, no implementado)
+**Protocolo:**
+- Request: `{"pid": 1234, "features": {...}}`
+- Response: `{"p_attack": 0.89, "verdict": "attack", "scores": {...}, "flags": [...]}`
 
-**Ubicación:** No existe en disco. Diseñado como trabajo futuro.
+### 3.7 `train_model.py` — Entrenamiento Offline
 
-**Pipeline de entrenamiento (diseño):**
+**Ubicación:** `src/train_model.py` (107 líneas)
+
+**Pipeline de entrenamiento:**
 
 ```
-CSV (features_labeled.csv)
+CSV (data/features_labeled.csv)
   │
   ├─ SMOTE (balanceo de clases)
   ├─ StandardScaler (normalización)
@@ -370,15 +375,22 @@ CSV (features_labeled.csv)
   └─ Serialización: scaler.pkl, rf.pkl, xgb.json
 ```
 
-**Dependencias:** `python/requirements.txt` ✅ (numpy, scikit-learn, xgboost, pandas, imbalanced-learn)
+**Dependencias:** `python/requirements.txt` ✅ (numpy, scikit-learn, xgboost, pandas, imbalanced-learn, matplotlib)
+
+**Uso:**
+```bash
+python3 src/train_model.py
+```
+
+**Salida:** Modelos en `/var/lib/guardian/models/`, gráfico de importancia de features en `reports/feature_importance.png`.
 
 ### 3.8 Módulos de Soporte (todos implementados ✅)
 
 | Módulo | Archivo | Header | Líneas | Propósito |
 |---|---|---|---|---|
-| **ring_buffer** | `src/ring_buffer.c` | `include/ring_buffer.h` | 65 | Buffer circular thread-safe con mutex + condition variables. Push/Pop bloqueantes. Capacidad 64K eventos `io_event_t`. |
-| **mitigation** | `src/mitigation.c` | `include/mitigation.h` | 14 | `mitigation_kill_process(pid)` — envía SIGKILL al proceso atacante. |
-| **analyzer** | `src/analyzer.c` | `include/analyzer.h` | 49 | `analyzer_thread()` — hilo background que consume eventos del ring buffer. Stub actual: loguea eventos. Tiene `ml_connect()` preparada para futuro socket Unix al servidor ML. |
+| **ring_buffer** | `src/ring_buffer.c` | `include/ring_buffer.h` | 81 | Buffer circular thread-safe con mutex + condition variables. Push/Pop bloqueantes + try_pop no bloqueante. Capacidad 64K eventos `io_event_t`. |
+| **mitigation** | `src/mitigation.c` | `include/mitigation.h` | 16 | `mitigation_kill_process(pid)` — envía SIGKILL al proceso atacante. |
+| **analyzer** | `src/analyzer.c` | `include/analyzer.h` | 245 | `analyzer_thread()` — hilo background que consume eventos del ring buffer vía `ring_buf_try_pop()`, acumula estadísticas por PID en ventanas de 5s, conecta a ML server vía Unix socket, reintenta conexión cada 5s si falla. |
 
 **Tests asociados:**
 
@@ -448,19 +460,24 @@ Ransomware renombra A_important_report.docx → A_important_report.locked
   → return -EPERM
 ```
 
-### 4.4 Flujo de ML Asíncrono (⚠️ Planeado, no implementado aún)
+### 4.4 Flujo de ML Asíncrono
 
 ```
-analyzer_thread (segundo plano, cada ~1s):
-  ├─ Consume ring_buffer de eventos vía ring_buf_pop()
-  ├─ Actual: loguea tipo, PID y path a stderr
-  ├─ Futuro:
-  │   ├─ Calcular feature vector por PID (14 features)
-  │   ├─ Conectar a /tmp/guardian_ml.sock (Unix socket)
-  │   ├─ Enviar JSON: {"features": {...}, "pid": 1234}
-  │   ├─ Recibir JSON: {"p_attack": 0.89, "verdict": "attack", ...}
-  │   └─ Si p_attack ≥ 0.75 → modificar score del detector
-  └─ Por ahora: detector.c cubre toda la detección sin dependencia de Python
+analyzer_thread (segundo plano):
+  ├─ Consume ring_buffer de eventos vía ring_buf_try_pop() (no bloqueante)
+  ├─ Si no hay eventos: duerme 50ms y reintenta conexión ML si se cayó (cada 5s)
+  ├─ Acumula estadísticas por PID en pid_table (128 slots max):
+  │   ├─ write_count, total_bytes, entropy_sum, entropy_max
+  │   ├─ rename_count, unlink_count
+  │   └─ window_start (ventana de 5 segundos)
+  ├─ Cuando ventana expira y write_count >= 10:
+  │   ├─ Construye feature vector (14 features)
+  │   ├─ Conecta a /tmp/guardian_ml.sock (Unix socket) si está disponible
+  │   ├─ Envía JSON: {"features": {...}, "pid": 1234}
+  │   ├─ Recibe JSON: {"p_attack": 0.89, "verdict": "attack", ...}
+  │   ├─ Si verdict == "attack": llama a detector_confirm_attack()
+  │   └─ Resetea contadores de ventana
+  └─ Sin ML: solo rota ventanas y acumula stats (detección estadística pura)
 ```
 
 ### 4.5 Flujo de Recuperación (rollback)
@@ -622,14 +639,14 @@ La latencia de un socket round-trip a Python es ~1–5ms. Para no bloquear la sy
 | **ZFS Snapshots** | `src/zfs_snap.c` (96 líneas) | ✅ 3 funciones |
 | **Ring Buffer** | `src/ring_buffer.c` (65 líneas) | ✅ 4 funciones, 5 tests pasando |
 | **Mitigation** | `src/mitigation.c` (14 líneas) | ✅ 1 función, 2 tests pasando |
-| **Analyzer** | `src/analyzer.c` (49 líneas) | ✅ Stub funcional (loguea eventos) |
-| **Proxy FUSE** | `src/guardian_fs.c` (281 líneas) | ✅ 11 operaciones FUSE implementadas |
+| **Analyzer** | `src/analyzer.c` (245 líneas) | ✅ Hilo async completo: consume ring buffer, acumula stats por PID, conecta a ML server, reintenta conexión |
+| **Proxy FUSE** | `src/guardian_fs.c` (348 líneas) | ✅ 11 operaciones FUSE implementadas |
 | **Build system** | `CMakeLists.txt` + `tests/unit/CMakeLists.txt` | ✅ CMake 3.22+, C17, fuse3, pthread |
 | **Scripts** | `scripts/{install_deps,zfs_setup,mount,rollback,run_tests}.sh` | ✅ 5 scripts operacionales |
 | **Configs** | `configs/{guardian,logging}.conf` | ✅ Preparados, no leídos por el binario aún |
 | **Python deps** | `python/requirements.txt` | ✅ 7 dependencias listas |
 | **Unit tests** | `tests/unit/test_{entropy,detector,canary,ring_buffer,mitigation}.c` | ✅ 28 tests, 83 assertions, 0 fallos |
-| **Docs** | `docs/{architecture/README,CHANGES,testing-guide}.md` | ✅ 3 documentos actualizados |
+| **Docs** | `docs/{architecture/README,CHANGES,testing-guide,developer-guide,ml-architecture,pending}.md` | ✅ 6 documentos actualizados |
 
 **Total:** 8 módulos C compilan con 0 errores y 0 warnings (`-Wall -Wextra -Wpedantic`).
 
@@ -639,9 +656,9 @@ La latencia de un socket round-trip a Python es ~1–5ms. Para no bloquear la sy
 |---|---|---|---|
 | 1 | **Leer `configs/guardian.conf`** en vez de paths hardcodeados (`/zpool/data`, `tank/data`) | Alto — sin esto no se puede cambiar el dataset sin recompilar | 30 min |
 | 2 | **Handler de SIGTERM/SIGINT** para shutdown graceful (detener threads, desmontar FUSE, liberar recursos) | Alto — sin esto el proceso deja threads huérfanos | 20 min |
-| 3 | **Implementar `ml_server.py`** — servidor ML con ensemble (RF + XGBoost + IsolationForest + LSTM) | Medio — la detección actual es solo estadística; ML daría segunda opinión | 4–6 h |
-| 4 | **Implementar `train_model.py`** — pipeline de entrenamiento offline con SMOTE + validación cruzada | Depende de #3 | 2–3 h |
-| 5 | **Conectar `analyzer.c` al socket ML** — descomentar `ml_connect()` y enviar features reales | Depende de #3 | 1 h |
+| 3 | **ML server y entrenamiento** — `ml_server.py` y `train_model.py` están implementados; falta generar dataset CSV etiquetado y exporter de features desde FUSE | Medio — la detección actual es estadística; ML da segunda opinión asíncrona | 2–3 h (dataset) |
+| 4 | **Completar features parciales en `analyzer.c`** — varias features van en 0.0 (std, autocorr, chi2, read_write_ratio, ext_change_rate) | Medio — mejorar precisión del ML | 2 h |
+| 5 | **Liberar slots de `pid_table`** cuando mueren procesos (tope 128) | Bajo — evitar agotamiento de slots en sistemas long-running | 30 min |
 | 6 | **Integration test** — script que simule ransomware (escribe alta entropía, cambia extensiones, toca canaries) y verifique que el sistema bloquea | Medio — necesario para validar antes de mostrar | 1–2 h |
 | 7 | **Systemd unit file** — para correr guardian_fs como servicio al boot | Bajo — nice-to-have para la VM | 15 min |
 
@@ -692,7 +709,7 @@ La detección estadística (detector.c) es funcional y suficiente para demostrar
 | Funciones C implementadas | 32 |
 | Operaciones FUSE implementadas | 11/11 |
 | Scripts operacionales | 5/5 |
-| Documentación | 3 documentos (arquitectura, cambios, testing) |
+| Documentación | 6 documentos (arquitectura, cambios, testing, developer, ml-architecture, pending) |
 
 ---
 

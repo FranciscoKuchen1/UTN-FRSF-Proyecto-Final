@@ -112,9 +112,10 @@ Aplicación (usuario o ransomware)
         ▼
 ┌───────────────────────────────────────────────────┐
 │              analyzer.c (async thread)             │
-│  - Consume ring_buffer                             │
-│  - Actual: loguea eventos a stderr                 │
-│  - Futuro: envía features a ml_server.py           │
+│  - Consume ring_buffer vía ring_buf_try_pop()      │
+│  - Acumula stats por PID (ventana 5s)              │
+│  - Conecta a ml_server.py vía Unix socket          │
+│  - Reintenta conexión cada 5s si falla             │
 └───────────────────────────────────────────────────┘
         │
         │ (background thread, cada 60s)
@@ -140,7 +141,7 @@ Aplicación (usuario o ransomware)
 
 ### 4.1 guardian_fs.c — El Proxy FUSE
 
-**Archivo:** `src/guardian_fs.c` (281 líneas)  
+**Archivo:** `src/guardian_fs.c` (348 líneas)  
 **Rol:** Punto de entrada del sistema. Intercepta 11 operaciones FUSE.
 
 **¿Qué problema resuelve?** Es el "hombre en el medio" entre cualquier aplicación y el filesystem real. Sin esto, el ransomware escribe directamente en ZFS sin pasar por nuestro detector.
@@ -324,7 +325,7 @@ Cada `f(x)` es una función de normalización que mapea la señal cruda al rango
 
 ### 4.6 ring_buffer.c — Buffer Circular Thread-Safe
 
-**Archivo:** `src/ring_buffer.c` (65 líneas)  
+**Archivo:** `src/ring_buffer.c` (81 líneas)  
 **Rol:** Cola de comunicación entre el hilo principal (FUSE) y el hilo de análisis (analyzer).
 
 **¿Qué problema resuelve?** En `gfs_write`, no podemos hacer análisis pesados (ML) porque la syscall del usuario está bloqueada esperando. La solución es **productor-consumidor**: el hilo FUSE produce eventos y los encola rápido; el hilo analyzer los consume en background sin bloquear al usuario.
@@ -337,8 +338,9 @@ Cada `f(x)` es una función de normalización que mapea la señal cruda al rango
 **API:**
 ```c
 struct ring_buf *ring_buf_create(capacity, elem_size);
-int ring_buf_push(rb, &event);   // bloquea si lleno
-int ring_buf_pop(rb, &event);    // bloquea si vacío
+int ring_buf_push(rb, &event);       // bloquea si lleno
+int ring_buf_pop(rb, &event);        // bloquea si vacío
+int ring_buf_try_pop(rb, &event);    // no bloqueante, retorna -1 si vacío
 void ring_buf_destroy(rb);
 ```
 
@@ -353,17 +355,26 @@ void ring_buf_destroy(rb);
 
 ### 4.8 analyzer.c — Hilo de Análisis Asíncrono
 
-**Archivo:** `src/analyzer.c` (49 líneas)  
-**Rol:** Hilo background que consume el ring buffer. Actualmente es un stub.
+**Archivo:** `src/analyzer.c` (245 líneas)  
+**Rol:** Hilo background que consume el ring buffer, acumula estadísticas por PID y consulta al servidor ML.
 
-**Estado actual:** Loggea cada evento (tipo, PID, path) a stderr. Tiene preparada una función `ml_connect()` para conectarse vía Unix socket a `/tmp/guardian_ml.sock`.
+**Estado actual:** Implementación completa con las siguientes capacidades:
+1. Consume eventos del ring buffer vía `ring_buf_try_pop()` (no bloqueante).
+2. Acumula estadísticas por PID en `pid_table` (128 slots max): write_count, total_bytes, entropy_sum, entropy_max, rename_count, unlink_count.
+3. Ventanas temporales de 5 segundos (`ML_WINDOW_SECS`) con rotación automática.
+4. Conecta al servidor ML (`/tmp/guardian_ml.sock`) al iniciar.
+5. Si la conexión falla, reintenta cada 5 segundos mientras no haya eventos.
+6. Cuando la ventana expira y hay suficientes escrituras (>=10), construye un feature vector de 14 dimensiones y lo envía al ML server.
+7. Si el ML server responde con veredicto "attack", llama a `detector_confirm_attack()` para marcar el PID como atacante confirmado.
+8. Si el ML server no está disponible, solo rota ventanas sin enviar features (detección estadística pura).
 
-**Futuro:** Cuando el servidor ML (Python) esté implementado, este hilo:
-1. Acumulará eventos por PID.
-2. Calculará un feature vector de 14 dimensiones.
-3. Enviará el vector al servidor ML.
-4. Recibirá un veredicto (`attack`/`suspicious`/`normal`).
-5. Si `p_attack ≥ 0.75`, modificará el score del detector para forzar bloqueo.
+**Features enviadas al ML server:**
+- `entropy_mean`, `entropy_max`, `entropy_std` (0.0), `entropy_autocorr` (0.0)
+- `write_rate`, `bytes_written_rate`, `rename_rate`, `unlink_rate`
+- `read_write_ratio` (0.0), `chi2_stat` (0.0), `ext_change_rate` (0.0)
+- `canary_accessed` (0), `unique_dirs` (1), `file_type_variety` (1)
+
+**Nota:** Varias features aún van en 0.0 o valores hardcodeados porque no se calculan en el analyzer. Ver `docs/pending.md` para detalles.
 
 **¿Por qué un hilo separado?** La inferencia ML (aunque sea vía socket local) tiene latencia de 1–5ms. No podemos bloquear la syscall del usuario ese tiempo. El analyzer opera en background: la detección rápida (detector.c) frena el ataque inmediato; el ML da una segunda opinión para refinar.
 
@@ -489,7 +500,9 @@ Ver `docs/architecture/README.md` sección 7.2 para la lista completa priorizada
 | 🔴 Alta | Leer config dinámica en vez de paths hardcodeados | 30 min |
 | 🔴 Alta | Shutdown graceful (SIGTERM/SIGINT) | 20 min |
 | 🟡 Media | Integration test (simular ransomware) | 1–2 h |
-| 🟡 Media | Implementar `ml_server.py` | 4–6 h |
+| 🟡 Media | Completar features parciales en `analyzer.c` (std, autocorr, chi2, etc.) | 2 h |
+| 🟡 Media | Generar dataset CSV etiquetado para entrenamiento ML | 2–3 h |
+| 🟢 Baja | Liberar slots de `pid_table` cuando mueren procesos | 30 min |
 | 🟢 Baja | Systemd unit file | 15 min |
 
 ---

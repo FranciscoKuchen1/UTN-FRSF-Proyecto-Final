@@ -130,7 +130,7 @@ gcc -std=c17 -Wall -Wextra -Wpedantic \
 
 ---
 
-### 4. Ring Buffer — Lock-Free Circular Buffer
+### 4. Ring Buffer — Thread-Safe Circular Buffer
 
 **Source**: `src/ring_buffer.c`  
 **Header**: `include/ring_buffer.h`  
@@ -163,6 +163,11 @@ typedef struct {
     int       ext_changed;
 } io_event_t;
 ```
+
+**API variants**:
+- `ring_buf_push(rb, &event)` — bloqueante si el buffer está lleno
+- `ring_buf_pop(rb, &event)` — bloqueante si el buffer está vacío
+- `ring_buf_try_pop(rb, &event)` — no bloqueante, retorna -1 si está vacío (usado por `analyzer_thread`)
 
 **Dependencies**: `-lpthread` (mutex + condition variables for blocking push/pop)
 

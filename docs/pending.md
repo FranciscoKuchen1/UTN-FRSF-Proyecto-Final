@@ -1,26 +1,34 @@
 # Pendientes — Guardian FS
 
-Lo necesario para llegar a una prueba funcional en VM con ransomware real.
+Lo necesario para una prueba funcional en VM. Actualizado: 2026-08-08.
 
 ## Infraestructura
 
-- [ ] VM con ZFS (`tank/data`) y `libfuse3-dev` instalado
-- [ ] Compilar `guardian_fs` con `cmake -B build && cmake --build build`
+- [ ] VM con ZFS (`tank/data`) y `libfuse3-dev`
+- [ ] Compilar: `cmake -S . -B build && cmake --build build --parallel`
+- [ ] Montar: `sudo ./scripts/mount.sh /mnt/guardian_real /mnt/protected tank/data`
+- [ ] Leer `configs/guardian.conf` en el binario (hoy paths vía env / defaults)
+- [ ] Handler SIGTERM/SIGINT para shutdown graceful
 
 ## ML
 
-- [ ] Dataset etiquetado: muestras de E/S benignas + ransomware real
-- [ ] Script `python/train_model.py` para entrenar y exportar modelos a `/var/lib/guardian/models/`
-- [ ] Ejecutar `ml_server.py` como servicio antes de montar el FUSE
+Código base ya existe en `src/` (`ml_server.py`, `train_model.py`, cliente en `analyzer.c`).
+
+- [ ] Generar dataset de features (CSV): ventanas benignas `label=0`; ataques solo para eval
+- [ ] Export FUSE/analyzer → CSV de 14 features (hoy no hay exporter)
+- [ ] Entrenar: `python3 src/train_model.py` con `data/features_labeled.csv`
+- [ ] Modelos en `/var/lib/guardian/models/` y levantar `python3 src/ml_server.py` antes/junto al mount
+- [ ] Completar features parciales en `analyzer.c` (varias van en 0.0 hoy: std, autocorr, chi2, etc.)
+- [ ] Liberar slots de `pid_table` cuando mueren procesos (tope 128)
 
 ## Testing
 
-- [ ] Prueba con ransomware real en VM aislada (sin red, snapshots previos)
-- [ ] Validar detección por entropía, canaries, y bloqueo de escritura
-- [ ] Validar que ZFS snapshots se disparan ante `VERDICT_BLOCK`
-- [ ] Probar `simulate_ransomware.py` como smoke test previo
+- [ ] Smoke en VM: `scripts/simulate_ransomware.py --target-dir /mnt/protected` (**solo VM**)
+- [ ] Validar bloqueo por entropía, canaries y snapshot de emergencia
+- [ ] Validar rollback: `sudo ./scripts/rollback.sh tank/data latest`
+- [ ] Integration tests FUSE+ZFS (hoy unitarios en `tests/unit/`; `tests/test_analyzer.c` no está en CMake)
 
 ## Pulido
 
-- [ ] `pid_table`: liberar slots de procesos muertos (hoy se llenan 128 y mueren)
-- [ ] `get_env_or()`: memory leak de startup (bajo impacto, daemon long-running)
+- [ ] `get_env_or()`: leak menor de startup (daemon long-running)
+- [ ] Systemd unit opcional para `guardian_fs` + `ml_server`
