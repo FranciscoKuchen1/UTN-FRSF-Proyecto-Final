@@ -20,7 +20,7 @@
 extern struct ring_buf    *evbuf;
 extern struct detector_ctx *detector;
 
-#define ML_SOCKET_PATH    "/tmp/guardian_ml.sock"
+#define ML_SOCKET_PATH    "/tmp/guardian_ml_proxy.sock"
 #define ML_WINDOW_SECS    5
 #define MAX_PID_SLOTS     128
 
