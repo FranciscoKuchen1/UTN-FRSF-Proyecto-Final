@@ -41,6 +41,12 @@ python/data/*.parquet
 !python/data/.gitkeep
 !python/data/README.md
 
+# Datos de entrenamiento (nuevo directorio)
+data/*.csv
+data/*.parquet
+!data/README.md
+!data/feature_logger.py
+
 # Logs y reportes generados
 *.log
 *.jsonl
