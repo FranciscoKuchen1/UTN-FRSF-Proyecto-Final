@@ -37,9 +37,10 @@ cleanup() {
     [[ -n "$ML_SERVER_PID" ]] && kill "$ML_SERVER_PID" 2>/dev/null
     
     mountpoint -q "$MOUNTPOINT" 2>/dev/null && fusermount -u "$MOUNTPOINT" 2>/dev/null
-    rm -rf "$REAL_ROOT" "$MOUNTPOINT" "$LOG_DIR"
+    rm -rf "$REAL_ROOT" "$MOUNTPOINT"
     
     log_success "Cleanup complete"
+    log_info "Logs preserved in: $LOG_DIR"
 }
 
 trap cleanup EXIT

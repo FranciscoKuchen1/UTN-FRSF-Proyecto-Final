@@ -46,10 +46,11 @@ cleanup() {
         sleep 1
     fi
     
-    # Remove test directories
-    rm -rf "$REAL_ROOT" "$MOUNTPOINT" "$LOG_DIR"
+    # Remove test directories (but keep logs for debugging)
+    rm -rf "$REAL_ROOT" "$MOUNTPOINT"
     
     log_success "Cleanup complete"
+    log_info "Logs preserved in: $LOG_DIR"
 }
 
 trap cleanup EXIT
