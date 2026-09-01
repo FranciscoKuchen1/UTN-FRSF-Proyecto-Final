@@ -5,7 +5,7 @@ Scripts para probar el pipeline completo de feature logging para entrenamiento M
 ## Scripts disponibles
 
 ### 1. `test_ml_pipeline.sh` — Test completo desde cero
-Compila el proyecto, prepara directorios, ejecuta todos los componentes y verifica resultados.
+Configura el entorno Python, compila el proyecto, prepara directorios, ejecuta todos los componentes y verifica resultados.
 
 ```bash
 ./scripts/test_ml_pipeline.sh [label]
@@ -16,17 +16,18 @@ Compila el proyecto, prepara directorios, ejecuta todos los componentes y verifi
 
 **Qué hace:**
 1. Verifica requisitos del sistema
-2. Compila el proyecto
-3. Prepara directorios de prueba
-4. Inicia ml_server.py
-5. Inicia ml_proxy.py
-6. Monta FUSE
-7. Ejecuta simulador
-8. Verifica resultados
-9. Limpia todo al terminar
+2. Crea venv e instala dependencias Python si es necesario
+3. Compila el proyecto
+4. Prepara directorios de prueba
+5. Inicia ml_server.py
+6. Inicia ml_proxy.py
+7. Monta FUSE
+8. Ejecuta simulador o workload benigno
+9. Verifica resultados
+10. Limpia todo al terminar (preserva logs)
 
 ### 2. `quick_test_ml.sh` — Test rápido (proyecto ya compilado)
-Salta la compilación. Útil cuando ya hiciste build y solo querés probar el pipeline.
+Configura el entorno Python y salta la compilación. Útil cuando ya hiciste build y solo querés probar el pipeline.
 
 ```bash
 ./scripts/quick_test_ml.sh [label]
@@ -73,10 +74,16 @@ analyzer.c recibe veredicto
 ### FUSE no monta
 - Verificar que libfuse3 está instalado: `sudo apt install libfuse3-dev`
 - Verificar que el binario existe: `ls -lh build/guardian_fs`
+- Habilitar `user_allow_other` en `/etc/fuse.conf`
 
 ### ml_proxy no conecta
 - Verificar que ml_server.py está corriendo primero
 - Verificar socket: `ls -lh /tmp/guardian_ml.sock`
+
+### Python dependencies error
+- Los scripts crean automáticamente un venv en `.venv/`
+- Si falla la creación del venv: `sudo apt install python3-venv`
+- Las dependencias se instalan automáticamente: numpy, scikit-learn, xgboost, joblib
 
 ## Ejemplo de uso
 

@@ -64,13 +64,6 @@ check_requirements() {
         exit 1
     fi
     
-    # Check Python packages
-    if ! python3 -c "import numpy, sklearn, xgboost, joblib" 2>/dev/null; then
-        log_warn "Missing Python packages. Install with:"
-        echo "  pip3 install numpy scikit-learn xgboost joblib"
-        exit 1
-    fi
-    
     # Check FUSE
     if ! command -v fusermount3 &> /dev/null; then
         log_error "FUSE3 not found. Install with: sudo apt install libfuse3-dev"
@@ -83,7 +76,35 @@ check_requirements() {
         exit 1
     fi
     
-    log_success "All requirements met"
+    log_success "System requirements met"
+}
+
+setup_python_env() {
+    log_info "Setting up Python environment..."
+    
+    VENV_DIR="$PROJECT_ROOT/.venv"
+    PYTHON="$VENV_DIR/bin/python"
+    
+    # Create venv if it doesn't exist
+    if [[ ! -d "$VENV_DIR" ]]; then
+        log_info "Creating virtual environment..."
+        python3 -m venv "$VENV_DIR" || {
+            log_error "Failed to create venv. Install python3-venv: sudo apt install python3-venv"
+            exit 1
+        }
+    fi
+    
+    # Check if dependencies are installed
+    if ! "$PYTHON" -c "import numpy, sklearn, xgboost, joblib" 2>/dev/null; then
+        log_info "Installing Python dependencies..."
+        "$VENV_DIR/bin/pip" install --quiet numpy scikit-learn xgboost joblib || {
+            log_error "Failed to install dependencies"
+            exit 1
+        }
+        log_success "Dependencies installed"
+    else
+        log_success "Dependencies already installed"
+    fi
 }
 
 build_project() {
@@ -118,7 +139,7 @@ prepare_directories() {
 start_ml_server() {
     log_info "Starting ML server..."
     
-    python3 "$PROJECT_ROOT/src/ml_server.py" > "$LOG_DIR/ml_server.log" 2>&1 &
+    "$PYTHON" "$PROJECT_ROOT/src/ml_server.py" > "$LOG_DIR/ml_server.log" 2>&1 &
     ML_SERVER_PID=$!
     
     # Wait for socket to be created
@@ -138,7 +159,7 @@ start_ml_server() {
 start_ml_proxy() {
     log_info "Starting ML proxy (label: $LABEL)..."
     
-    python3 "$SCRIPT_DIR/ml_proxy.py" \
+    "$PYTHON" "$SCRIPT_DIR/ml_proxy.py" \
         --label "$LABEL" \
         --backend-socket /tmp/guardian_ml.sock \
         --output "$OUTPUT_CSV" \
@@ -190,7 +211,7 @@ run_simulator() {
         log_info "File count: 50"
         echo
         
-        python3 "$SCRIPT_DIR/simulate_ransomware.py" \
+        "$PYTHON" "$SCRIPT_DIR/simulate_ransomware.py" \
             --target-dir "$MOUNTPOINT" \
             --file-count 50 \
             --no-cleanup
@@ -249,6 +270,7 @@ main() {
     echo
     
     check_requirements
+    setup_python_env
     build_project
     prepare_directories
     start_ml_server

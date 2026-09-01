@@ -52,6 +52,28 @@ if [[ ! -x "$BUILD_DIR/guardian_fs" ]]; then
     exit 1
 fi
 
+# Setup Python environment
+log_info "Setting up Python environment..."
+VENV_DIR="$PROJECT_ROOT/.venv"
+PYTHON="$VENV_DIR/bin/python"
+
+if [[ ! -d "$VENV_DIR" ]]; then
+    log_info "Creating virtual environment..."
+    python3 -m venv "$VENV_DIR" || {
+        log_error "Failed to create venv. Install python3-venv: sudo apt install python3-venv"
+        exit 1
+    }
+fi
+
+if ! "$PYTHON" -c "import numpy, sklearn, xgboost, joblib" 2>/dev/null; then
+    log_info "Installing Python dependencies..."
+    "$VENV_DIR/bin/pip" install --quiet numpy scikit-learn xgboost joblib || {
+        log_error "Failed to install dependencies"
+        exit 1
+    }
+fi
+log_success "Python environment ready"
+
 # Setup
 mkdir -p "$REAL_ROOT" "$MOUNTPOINT" "$LOG_DIR"
 for i in {1..5}; do echo "Test file $i" > "$REAL_ROOT/test_$i.txt"; done
@@ -64,12 +86,12 @@ echo
 
 # Start components
 log_info "Starting ML server..."
-python3 "$PROJECT_ROOT/src/ml_server.py" > "$LOG_DIR/ml_server.log" 2>&1 &
+"$PYTHON" "$PROJECT_ROOT/src/ml_server.py" > "$LOG_DIR/ml_server.log" 2>&1 &
 ML_SERVER_PID=$!
 sleep 2
 
 log_info "Starting ML proxy (label: $LABEL)..."
-python3 "$SCRIPT_DIR/ml_proxy.py" --label "$LABEL" --backend-socket /tmp/guardian_ml.sock --output "$OUTPUT_CSV" > "$LOG_DIR/ml_proxy.log" 2>&1 &
+"$PYTHON" "$SCRIPT_DIR/ml_proxy.py" --label "$LABEL" --backend-socket /tmp/guardian_ml.sock --output "$OUTPUT_CSV" > "$LOG_DIR/ml_proxy.log" 2>&1 &
 ML_PROXY_PID=$!
 sleep 1
 
@@ -88,7 +110,7 @@ fi
 # Run simulator or benign workload based on label
 if [[ "$LABEL" == "1" ]]; then
     log_info "Running ransomware simulator..."
-    python3 "$SCRIPT_DIR/simulate_ransomware.py" --target-dir "$MOUNTPOINT" --file-count 50 --no-cleanup
+    "$PYTHON" "$SCRIPT_DIR/simulate_ransomware.py" --target-dir "$MOUNTPOINT" --file-count 50 --no-cleanup
 else
     log_info "Running benign workload..."
     # Benign workload: normal file operations (create, read, modify, delete)
