@@ -84,9 +84,20 @@ if ! mountpoint -q "$MOUNTPOINT"; then
     exit 1
 fi
 
-# Run simulator
-log_info "Running simulator..."
-python3 "$SCRIPT_DIR/simulate_ransomware.py" --target-dir "$MOUNTPOINT" --file-count 50 --no-cleanup
+# Run simulator or benign workload based on label
+if [[ "$LABEL" == "1" ]]; then
+    log_info "Running ransomware simulator..."
+    python3 "$SCRIPT_DIR/simulate_ransomware.py" --target-dir "$MOUNTPOINT" --file-count 50 --no-cleanup
+else
+    log_info "Running benign workload..."
+    # Benign workload: normal file operations (create, read, modify, delete)
+    for i in {1..20}; do
+        echo "Normal document content $i" > "$MOUNTPOINT/doc_$i.txt"
+        cat "$MOUNTPOINT/doc_$i.txt" > /dev/null
+        echo "Updated content $i" >> "$MOUNTPOINT/doc_$i.txt"
+    done
+    log_success "Benign workload completed"
+fi
 
 # Wait for processing
 log_info "Waiting for analyzer..."

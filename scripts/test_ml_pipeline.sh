@@ -183,17 +183,32 @@ start_fuse() {
 }
 
 run_simulator() {
-    log_info "Running ransomware simulator..."
-    log_info "Target: $MOUNTPOINT (FUSE mountpoint)"
-    log_info "File count: 50"
-    echo
-    
-    python3 "$SCRIPT_DIR/simulate_ransomware.py" \
-        --target-dir "$MOUNTPOINT" \
-        --file-count 50 \
-        --no-cleanup
-    
-    log_success "Simulator completed"
+    if [[ "$LABEL" == "1" ]]; then
+        log_info "Running ransomware simulator..."
+        log_info "Target: $MOUNTPOINT (FUSE mountpoint)"
+        log_info "File count: 50"
+        echo
+        
+        python3 "$SCRIPT_DIR/simulate_ransomware.py" \
+            --target-dir "$MOUNTPOINT" \
+            --file-count 50 \
+            --no-cleanup
+        
+        log_success "Simulator completed"
+    else
+        log_info "Running benign workload..."
+        log_info "Target: $MOUNTPOINT (FUSE mountpoint)"
+        echo
+        
+        # Benign workload: normal file operations
+        for i in {1..20}; do
+            echo "Normal document content $i" > "$MOUNTPOINT/doc_$i.txt"
+            cat "$MOUNTPOINT/doc_$i.txt" > /dev/null
+            echo "Updated content $i" >> "$MOUNTPOINT/doc_$i.txt"
+        done
+        
+        log_success "Benign workload completed"
+    fi
 }
 
 verify_results() {
