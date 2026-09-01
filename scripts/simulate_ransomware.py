@@ -26,7 +26,7 @@ import time
 
 
 # ── Nombres y extensiones plausibles ──
-FAKE_FILES = [
+FAKE_FILES_SAFE = [
     "Q4_financial_report.xlsx",
     "client_contract_2025.docx",
     "employee_salaries_HR.pdf",
@@ -37,9 +37,14 @@ FAKE_FILES = [
     "company_logo_branding.png",
     "database_dump_schema.sql",
     "meeting_notes_weekly.txt",
+]
+
+FAKE_FILES_CANARY = [
     "A_important_report.docx",      # empieza con "A_" — como los canaries
     "ZZ_backup_keys.txt",           # empieza con "ZZ_" — como los canaries
 ]
+
+FAKE_FILES = FAKE_FILES_SAFE + FAKE_FILES_CANARY
 
 TARGET_EXTENSIONS = [".locked", ".enc", ".crypt", ".ransom", ".encrypted"]
 CANARY_PATTERNS   = [
@@ -60,13 +65,16 @@ def is_canary_like(filename: str) -> bool:
     return False
 
 
-def deploy_files(target_dir: str, count: int) -> list:
+def deploy_files(target_dir: str, count: int, avoid_canary: bool = False) -> list:
     """Crea archivos de prueba con contenido plausible en target_dir."""
     created = []
     os.makedirs(target_dir, exist_ok=True)
 
+    # Seleccionar qué archivos usar según si queremos evitar canaries
+    files_to_use = FAKE_FILES_SAFE if avoid_canary else FAKE_FILES
+
     for i in range(count):
-        name = FAKE_FILES[i % len(FAKE_FILES)]
+        name = files_to_use[i % len(files_to_use)]
         # Evitar colisiones de nombres
         base, ext = os.path.splitext(name)
         fname = f"{base}_{i}{ext}"
@@ -90,6 +98,7 @@ def simulate_ransomware(
     rename: bool = True,
     canary_hunt: bool = False,
     cleanup: bool = True,
+    avoid_canary: bool = False,
 ):
     """
     Simula el comportamiento de ransomware sobre un directorio.
@@ -102,9 +111,11 @@ def simulate_ransomware(
     ext = random.choice(TARGET_EXTENSIONS)
     print(f"[*] Mode: {mode} | Files: {file_count} | "
           f"Rename: {rename} | Extension: {ext} | Pause: {pause_ms}ms")
+    if avoid_canary:
+        print(f"[*] Avoiding canary-like filenames (for ML training data)")
     print(f"[*] Target: {target_dir}")
 
-    files = deploy_files(target_dir, file_count)
+    files = deploy_files(target_dir, file_count, avoid_canary=avoid_canary)
     total_bytes = 0
     start = time.time()
 
@@ -213,6 +224,10 @@ def main():
         "--no-cleanup", action="store_false", dest="cleanup",
         help="Leave encrypted files for inspection"
     )
+    parser.add_argument(
+        "--avoid-canary", action="store_true",
+        help="Avoid canary-like filenames (for ML training data generation)"
+    )
 
     args = parser.parse_args()
 
@@ -228,6 +243,7 @@ def main():
         rename=args.rename,
         canary_hunt=args.canary_hunt,
         cleanup=args.cleanup,
+        avoid_canary=args.avoid_canary,
     )
 
 

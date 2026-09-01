@@ -110,7 +110,7 @@ fi
 # Run simulator or benign workload based on label
 if [[ "$LABEL" == "1" ]]; then
     log_info "Running ransomware simulator..."
-    "$PYTHON" "$SCRIPT_DIR/simulate_ransomware.py" --target-dir "$MOUNTPOINT" --file-count 50 --no-cleanup
+    "$PYTHON" "$SCRIPT_DIR/simulate_ransomware.py" --target-dir "$MOUNTPOINT" --file-count 50 --no-cleanup --avoid-canary
 else
     log_info "Running benign workload..."
     # Benign workload: normal file operations (create, read, modify, delete)

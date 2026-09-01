@@ -214,7 +214,8 @@ run_simulator() {
         "$PYTHON" "$SCRIPT_DIR/simulate_ransomware.py" \
             --target-dir "$MOUNTPOINT" \
             --file-count 50 \
-            --no-cleanup
+            --no-cleanup \
+            --avoid-canary
         
         log_success "Simulator completed"
     else
