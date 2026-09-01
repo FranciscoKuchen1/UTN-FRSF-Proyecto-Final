@@ -88,12 +88,40 @@ echo
 log_info "Starting ML server..."
 "$PYTHON" "$PROJECT_ROOT/src/ml_server.py" > "$LOG_DIR/ml_server.log" 2>&1 &
 ML_SERVER_PID=$!
-sleep 2
+
+# Wait and verify
+for i in {1..10}; do
+    if ! kill -0 "$ML_SERVER_PID" 2>/dev/null; then
+        log_error "ML server died. Check: $LOG_DIR/ml_server.log"
+        cat "$LOG_DIR/ml_server.log"
+        exit 1
+    fi
+    if [[ -S /tmp/guardian_ml.sock ]]; then
+        log_success "ML server started (PID: $ML_SERVER_PID)"
+        break
+    fi
+    sleep 0.5
+done
+
+sleep 1
 
 log_info "Starting ML proxy (label: $LABEL)..."
 "$PYTHON" "$SCRIPT_DIR/ml_proxy.py" --label "$LABEL" --backend-socket /tmp/guardian_ml.sock --output "$OUTPUT_CSV" > "$LOG_DIR/ml_proxy.log" 2>&1 &
 ML_PROXY_PID=$!
-sleep 1
+
+# Wait and verify
+for i in {1..10}; do
+    if ! kill -0 "$ML_PROXY_PID" 2>/dev/null; then
+        log_error "ML proxy died. Check: $LOG_DIR/ml_proxy.log"
+        cat "$LOG_DIR/ml_proxy.log"
+        exit 1
+    fi
+    if [[ -S /tmp/guardian_ml_proxy.sock ]]; then
+        log_success "ML proxy started (PID: $ML_PROXY_PID)"
+        break
+    fi
+    sleep 0.5
+done
 
 log_info "Starting FUSE..."
 export GUARDIAN_REAL_ROOT="$REAL_ROOT"

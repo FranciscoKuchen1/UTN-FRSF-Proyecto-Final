@@ -144,6 +144,13 @@ start_ml_server() {
     
     # Wait for socket to be created
     for i in {1..10}; do
+        # Check if process is still alive
+        if ! kill -0 "$ML_SERVER_PID" 2>/dev/null; then
+            log_error "ML server process died. Check: $LOG_DIR/ml_server.log"
+            cat "$LOG_DIR/ml_server.log"
+            exit 1
+        fi
+        
         if [[ -S /tmp/guardian_ml.sock ]]; then
             log_success "ML server started (PID: $ML_SERVER_PID)"
             return 0
@@ -151,7 +158,7 @@ start_ml_server() {
         sleep 0.5
     done
     
-    log_error "ML server failed to start. Check: $LOG_DIR/ml_server.log"
+    log_error "ML server failed to create socket. Check: $LOG_DIR/ml_server.log"
     cat "$LOG_DIR/ml_server.log"
     exit 1
 }
@@ -168,6 +175,13 @@ start_ml_proxy() {
     
     # Wait for socket to be created
     for i in {1..10}; do
+        # Check if process is still alive
+        if ! kill -0 "$ML_PROXY_PID" 2>/dev/null; then
+            log_error "ML proxy process died. Check: $LOG_DIR/ml_proxy.log"
+            cat "$LOG_DIR/ml_proxy.log"
+            exit 1
+        fi
+        
         if [[ -S /tmp/guardian_ml_proxy.sock ]]; then
             log_success "ML proxy started (PID: $ML_PROXY_PID)"
             return 0
@@ -175,7 +189,7 @@ start_ml_proxy() {
         sleep 0.5
     done
     
-    log_error "ML proxy failed to start. Check: $LOG_DIR/ml_proxy.log"
+    log_error "ML proxy failed to create socket. Check: $LOG_DIR/ml_proxy.log"
     cat "$LOG_DIR/ml_proxy.log"
     exit 1
 }
