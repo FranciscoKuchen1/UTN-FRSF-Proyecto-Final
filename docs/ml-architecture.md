@@ -145,7 +145,7 @@ Estas features miden las propiedades estadísticas de los bytes escritos.
 | # | Feature | Fórmula | Qué captura |
 |---|---|---|---|
 | 9 | `read_write_ratio` | `bytes_read / bytes_written` | Ratio lectura/escritura. El ransomware lee un archivo, lo cifra en memoria, y escribe la versión cifrada → ratio ≈ 1.0. Un backup SOLO lee (ratio >> 1). Un generador de datos SOLO escribe (ratio ≈ 0). |
-| 10 | `chi2_stat` | `χ²(byte_histogram)` | Test de uniformidad de la distribución de bytes acumulada en la ventana. χ² < 300 con 255 g.l. → distribución uniforme → cifrado real. |
+| 10 | `chi2_stat` | promedio `χ²(buf)` por write ≥ 256B | Test de uniformidad por escritura. χ² < 300 con 255 g.l. → distribución uniforme → cifrado real; texto/ELF estructurado → χ² muy alto. Writes < 256B se excluyen (muestra insuficiente). |
 | 11 | `ext_change_rate` | `ext_changes / rename_count` | Proporción de renombrados que cambian la extensión (`.docx` → `.locked`). Comportamiento casi exclusivo de ransomware. |
 | 12 | `canary_accessed` | `0 \| 1` | Booleano: ¿el proceso tocó un archivo canary? Feature de altísimo poder discriminante. |
 

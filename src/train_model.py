@@ -23,7 +23,7 @@ import xgboost as xgb
 import matplotlib.pyplot as plt
 import joblib
 
-DATA_PATH  = Path("data/features_labeled.csv")
+DATA_PATH  = Path("data/training_data.csv")
 MODEL_DIR  = Path("/var/lib/guardian/models")
 
 def load_and_balance(path: Path):

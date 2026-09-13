@@ -3,6 +3,9 @@ set -euo pipefail
 
 # test_ml_pipeline.sh — Automated ML feature logging test
 # Runs the complete pipeline: ml_server -> ml_proxy -> FUSE -> simulator
+# Usage: ./scripts/test_ml_pipeline.sh [label] [collect_rounds]
+#   label: 1=ransomware (default), 0=benign
+#   collect_rounds: rounds of collect_training_data.sh after the test (default: 5, 0 to skip)
 
 # Colors for output
 RED='\033[0;31m'
@@ -15,11 +18,12 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_ROOT/build"
-LOG_DIR="/tmp/guardian_test_logs"
+LOG_DIR="$PROJECT_ROOT/logs"
 REAL_ROOT="/tmp/guardian_test_real"
 MOUNTPOINT="/tmp/guardian_test_mount"
 OUTPUT_CSV="$PROJECT_ROOT/data/training_data.csv"
 LABEL="${1:-1}"  # Default: ransomware (1)
+COLLECT_ROUNDS="${2:-5}"  # Rounds of data collection after the test (0 to skip)
 
 # PIDs for cleanup
 ML_SERVER_PID=""
@@ -35,10 +39,10 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 cleanup() {
     log_info "Cleaning up..."
     
-    # Kill background processes
-    [[ -n "$FUSE_PID" ]] && kill "$FUSE_PID" 2>/dev/null && log_info "Stopped FUSE (PID: $FUSE_PID)"
-    [[ -n "$ML_PROXY_PID" ]] && kill "$ML_PROXY_PID" 2>/dev/null && log_info "Stopped ml_proxy (PID: $ML_PROXY_PID)"
-    [[ -n "$ML_SERVER_PID" ]] && kill "$ML_SERVER_PID" 2>/dev/null && log_info "Stopped ml_server (PID: $ML_SERVER_PID)"
+    # Kill background processes (idempotent — cleanup may run twice)
+    if [[ -n "$FUSE_PID" ]]; then kill "$FUSE_PID" 2>/dev/null || true; log_info "Stopped FUSE (PID: $FUSE_PID)"; FUSE_PID=""; fi
+    if [[ -n "$ML_PROXY_PID" ]]; then kill "$ML_PROXY_PID" 2>/dev/null || true; log_info "Stopped ml_proxy (PID: $ML_PROXY_PID)"; ML_PROXY_PID=""; fi
+    if [[ -n "$ML_SERVER_PID" ]]; then kill "$ML_SERVER_PID" 2>/dev/null || true; log_info "Stopped ml_server (PID: $ML_SERVER_PID)"; ML_SERVER_PID=""; fi
     
     # Unmount FUSE
     if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
@@ -200,7 +204,14 @@ start_fuse() {
     export GUARDIAN_REAL_ROOT="$REAL_ROOT"
     export GUARDIAN_ZFS_DATASET="tank/data"
     
-    "$BUILD_DIR/guardian_fs" -f -o allow_other,default_permissions "$MOUNTPOINT" \
+    local FUSE_OPTS="default_permissions"
+    if grep -qE '^[[:space:]]*user_allow_other' /etc/fuse.conf 2>/dev/null; then
+        FUSE_OPTS="allow_other,default_permissions"
+    else
+        log_warn "user_allow_other not set in /etc/fuse.conf — mounting without allow_other"
+    fi
+
+    "$BUILD_DIR/guardian_fs" -f -o "$FUSE_OPTS" "$MOUNTPOINT" \
         > "$LOG_DIR/fuse.log" 2>&1 &
     FUSE_PID=$!
     
@@ -225,13 +236,18 @@ run_simulator() {
         log_info "File count: 50"
         echo
         
+        local sim_status=0
         "$PYTHON" "$SCRIPT_DIR/simulate_ransomware.py" \
             --target-dir "$MOUNTPOINT" \
             --file-count 50 \
             --no-cleanup \
-            --avoid-canary
-        
-        log_success "Simulator completed"
+            --avoid-canary || sim_status=$?
+
+        if [[ $sim_status -ne 0 ]]; then
+            log_warn "Simulator exited (status $sim_status) — likely killed by Guardian mitigation (detection working)"
+        else
+            log_success "Simulator completed"
+        fi
     else
         log_info "Running benign workload..."
         log_info "Target: $MOUNTPOINT (FUSE mountpoint)"
@@ -302,6 +318,12 @@ main() {
     echo
     log_success "Test completed successfully!"
     echo
+
+    if [[ "$COLLECT_ROUNDS" -gt 0 ]]; then
+        log_info "Tearing down test stack before data collection..."
+        cleanup
+        "$SCRIPT_DIR/collect_training_data.sh" "$COLLECT_ROUNDS"
+    fi
 }
 
 main

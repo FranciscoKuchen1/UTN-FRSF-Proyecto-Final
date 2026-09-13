@@ -8,12 +8,14 @@
 #define EV_WRITE  2
 #define EV_RENAME 3
 #define EV_UNLINK 4
+#define EV_CANARY 5
 
 typedef struct {
     int       type;
     uint32_t  pid;
     char      path[4096];
     double    entropy;
+    double    chi2;
     uint64_t  size;
     uint64_t  ts_ns;
     int       ext_changed;

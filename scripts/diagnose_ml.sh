@@ -13,6 +13,9 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+LOG_DIR="$PROJECT_ROOT/logs"
+
+mkdir -p "$LOG_DIR"
 
 log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
@@ -65,15 +68,16 @@ fi
 # Test ml_server.py
 log_info "Testing ml_server.py..."
 rm -f /tmp/guardian_ml.sock /tmp/guardian_ml_proxy.sock
+rm -f "$LOG_DIR/diagnose_features.csv"
 
-"$PYTHON" "$PROJECT_ROOT/src/ml_server.py" > /tmp/test_ml_server.log 2>&1 &
+"$PYTHON" "$PROJECT_ROOT/src/ml_server.py" > "$LOG_DIR/diagnose_ml_server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
 
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     log_error "ml_server.py died immediately"
     log_info "Output:"
-    cat /tmp/test_ml_server.log
+    cat "$LOG_DIR/diagnose_ml_server.log"
     exit 1
 fi
 
@@ -82,21 +86,21 @@ if [[ -S /tmp/guardian_ml.sock ]]; then
 else
     log_error "ml_server.py socket not created"
     log_info "Output:"
-    cat /tmp/test_ml_server.log
+    cat "$LOG_DIR/diagnose_ml_server.log"
     kill "$SERVER_PID" 2>/dev/null || true
     exit 1
 fi
 
 # Test ml_proxy.py
 log_info "Testing ml_proxy.py..."
-"$PYTHON" "$SCRIPT_DIR/ml_proxy.py" --label 1 --backend-socket /tmp/guardian_ml.sock --output /tmp/test_diag.csv > /tmp/test_ml_proxy.log 2>&1 &
+"$PYTHON" "$SCRIPT_DIR/ml_proxy.py" --label 1 --backend-socket /tmp/guardian_ml.sock --output "$LOG_DIR/diagnose_features.csv" > "$LOG_DIR/diagnose_ml_proxy.log" 2>&1 &
 PROXY_PID=$!
 sleep 2
 
 if ! kill -0 "$PROXY_PID" 2>/dev/null; then
     log_error "ml_proxy.py died immediately"
     log_info "Output:"
-    cat /tmp/test_ml_proxy.log
+    cat "$LOG_DIR/diagnose_ml_proxy.log"
     kill "$SERVER_PID" 2>/dev/null || true
     exit 1
 fi
@@ -106,7 +110,7 @@ if [[ -S /tmp/guardian_ml_proxy.sock ]]; then
 else
     log_error "ml_proxy.py socket not created"
     log_info "Output:"
-    cat /tmp/test_ml_proxy.log
+    cat "$LOG_DIR/diagnose_ml_proxy.log"
     kill "$SERVER_PID" "$PROXY_PID" 2>/dev/null || true
     exit 1
 fi
@@ -130,8 +134,8 @@ print('Response:', response[:50])
 
 sleep 1
 
-if [[ -f /tmp/test_diag.csv ]]; then
-    lines=$(wc -l < /tmp/test_diag.csv)
+if [[ -f "$LOG_DIR/diagnose_features.csv" ]]; then
+    lines=$(wc -l < "$LOG_DIR/diagnose_features.csv")
     if [[ $lines -gt 1 ]]; then
         log_success "Feature logged successfully ($((lines - 1)) features)"
     else
@@ -141,10 +145,12 @@ else
     log_error "CSV not created"
 fi
 
-# Cleanup
+# Cleanup (processes and sockets only — logs are preserved)
 kill "$SERVER_PID" "$PROXY_PID" 2>/dev/null || true
-rm -f /tmp/guardian_ml*.sock /tmp/test_diag.csv /tmp/test_ml_*.log
+rm -f /tmp/guardian_ml*.sock
 
 echo
 log_success "Diagnostic complete!"
+log_info "Logs preserved in: $LOG_DIR"
+log_info "Feature CSV: $LOG_DIR/diagnose_features.csv"
 echo

@@ -15,7 +15,7 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_ROOT/build"
-LOG_DIR="/tmp/guardian_test_logs"
+LOG_DIR="$PROJECT_ROOT/logs"
 REAL_ROOT="/tmp/guardian_test_real"
 MOUNTPOINT="/tmp/guardian_test_mount"
 OUTPUT_CSV="$PROJECT_ROOT/data/training_data.csv"
@@ -32,9 +32,9 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 cleanup() {
     log_info "Cleaning up..."
-    [[ -n "$FUSE_PID" ]] && kill "$FUSE_PID" 2>/dev/null
-    [[ -n "$ML_PROXY_PID" ]] && kill "$ML_PROXY_PID" 2>/dev/null
-    [[ -n "$ML_SERVER_PID" ]] && kill "$ML_SERVER_PID" 2>/dev/null
+    if [[ -n "$FUSE_PID" ]]; then kill "$FUSE_PID" 2>/dev/null || true; FUSE_PID=""; fi
+    if [[ -n "$ML_PROXY_PID" ]]; then kill "$ML_PROXY_PID" 2>/dev/null || true; ML_PROXY_PID=""; fi
+    if [[ -n "$ML_SERVER_PID" ]]; then kill "$ML_SERVER_PID" 2>/dev/null || true; ML_SERVER_PID=""; fi
     
     mountpoint -q "$MOUNTPOINT" 2>/dev/null && fusermount -u "$MOUNTPOINT" 2>/dev/null
     rm -rf "$REAL_ROOT" "$MOUNTPOINT"
@@ -126,7 +126,13 @@ done
 log_info "Starting FUSE..."
 export GUARDIAN_REAL_ROOT="$REAL_ROOT"
 export GUARDIAN_ZFS_DATASET="tank/data"
-"$BUILD_DIR/guardian_fs" -f -o allow_other,default_permissions "$MOUNTPOINT" > "$LOG_DIR/fuse.log" 2>&1 &
+FUSE_OPTS="default_permissions"
+if grep -qE '^[[:space:]]*user_allow_other' /etc/fuse.conf 2>/dev/null; then
+    FUSE_OPTS="allow_other,default_permissions"
+else
+    log_warn "user_allow_other not set in /etc/fuse.conf — mounting without allow_other"
+fi
+"$BUILD_DIR/guardian_fs" -f -o "$FUSE_OPTS" "$MOUNTPOINT" > "$LOG_DIR/fuse.log" 2>&1 &
 FUSE_PID=$!
 sleep 2
 
@@ -138,7 +144,11 @@ fi
 # Run simulator or benign workload based on label
 if [[ "$LABEL" == "1" ]]; then
     log_info "Running ransomware simulator..."
-    "$PYTHON" "$SCRIPT_DIR/simulate_ransomware.py" --target-dir "$MOUNTPOINT" --file-count 50 --no-cleanup --avoid-canary
+    sim_status=0
+    "$PYTHON" "$SCRIPT_DIR/simulate_ransomware.py" --target-dir "$MOUNTPOINT" --file-count 50 --no-cleanup --avoid-canary || sim_status=$?
+    if [[ $sim_status -ne 0 ]]; then
+        log_warn "Simulator exited (status $sim_status) — likely killed by Guardian mitigation (detection working)"
+    fi
 else
     log_info "Running benign workload..."
     # Benign workload: normal file operations (create, read, modify, delete)

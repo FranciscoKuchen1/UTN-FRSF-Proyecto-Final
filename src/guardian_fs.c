@@ -123,6 +123,10 @@ static int gfs_open(const char *path, struct fuse_file_info *fi) {
     /* Detectar apertura de canary */
     if (canary_is_canary(gstate.can, path)) {
         uint32_t pid = fuse_get_context()->pid;
+        io_event_t cev = { .type = EV_CANARY, .pid = pid,
+                           .ts_ns = clock_gettime_ns() };
+        strncpy(cev.path, path, sizeof(cev.path) - 1);
+        ring_buf_push(gstate.evbuf, &cev);
         log_event("canary_accessed", pid, path,
                   "\"verdict\":\"SUSPICIOUS\"");
         detector_signal_canary(gstate.det, path, pid);
@@ -154,8 +158,9 @@ static int gfs_write(const char *path, const char *buf, size_t size,
     struct fuse_context *ctx = fuse_get_context();
     uint32_t pid = ctx->pid;
 
-    /* 1. Calcular entropía del buffer entrante */
-    double ent = entropy_shannon((const uint8_t *)buf, size);
+    /* 1. Calcular entropía y χ² del buffer entrante */
+    double ent  = entropy_shannon((const uint8_t *)buf, size);
+    double chi2 = size >= 256 ? entropy_chi_square((const uint8_t *)buf, size) : 0.0;
 
     /* 2. Registrar evento */
     io_event_t ev = {
@@ -163,6 +168,7 @@ static int gfs_write(const char *path, const char *buf, size_t size,
         .pid     = pid,
         .size    = (uint64_t)size,
         .entropy = ent,
+        .chi2    = chi2,
         .ts_ns   = clock_gettime_ns(),
     };
     strncpy(ev.path, path, sizeof(ev.path) - 1);
@@ -229,6 +235,10 @@ static int gfs_unlink(const char *path) {
 
     if (canary_is_canary(gstate.can, path)) {
         /* Eliminación de canary = ataque confirmado */
+        io_event_t cev = { .type = EV_CANARY, .pid = pid,
+                           .ts_ns = clock_gettime_ns() };
+        strncpy(cev.path, path, sizeof(cev.path) - 1);
+        ring_buf_push(gstate.evbuf, &cev);
         log_event("canary_deleted", pid, path,
                   "\"verdict\":\"ATTACK_CONFIRMED\"");
         zfs_snapshot_emergency(gstate.zfs_dataset);
@@ -330,7 +340,7 @@ int main(int argc, char *argv[]) {
      * is negligible and the OS reclaims it on process exit. */
     gstate.det         = detector_init(WINDOW_SECS, ENTROPY_THRESHOLD,
                                        WRITE_RATE_THRESH, RENAME_THRESH);
-    gstate.can         = canary_init("/zpool/data");
+    gstate.can         = canary_init(gstate.real_root);
     gstate.evbuf       = ring_buf_create(65536, sizeof(io_event_t));
     gstate.running     = 1;
 

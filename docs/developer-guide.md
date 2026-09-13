@@ -368,13 +368,16 @@ void ring_buf_destroy(rb);
 7. Si el ML server responde con veredicto "attack", llama a `detector_confirm_attack()` para marcar el PID como atacante confirmado.
 8. Si el ML server no está disponible, solo rota ventanas sin enviar features (detección estadística pura).
 
-**Features enviadas al ML server:**
-- `entropy_mean`, `entropy_max`, `entropy_std` (0.0), `entropy_autocorr` (0.0)
+**Features enviadas al ML server (14/14 calculadas):**
+- `entropy_mean`, `entropy_max`, `entropy_std`, `entropy_autocorr` (Pearson lag-1 sobre las últimas 32 entropías por PID, vía `entropy.c`)
 - `write_rate`, `bytes_written_rate`, `rename_rate`, `unlink_rate`
-- `read_write_ratio` (0.0), `chi2_stat` (0.0), `ext_change_rate` (0.0)
-- `canary_accessed` (0), `unique_dirs` (1), `file_type_variety` (1)
+- `read_write_ratio` (eventos `EV_READ` / `EV_WRITE`)
+- `chi2_stat` (promedio del χ² por write; solo writes ≥ 256 bytes — `entropy_chi_square()` devuelve 1e9 como sentinel para muestras menores, se filtra)
+- `ext_change_rate` (renames con cambio de extensión / renames totales, vía `ev.ext_changed`)
+- `canary_accessed` (eventos `EV_CANARY`: apertura o borrado de archivo canary)
+- `unique_dirs`, `file_type_variety` (sets de hashes FNV-1a de directorios y extensiones, tope 16 distintos por ventana)
 
-**Nota:** Varias features aún van en 0.0 o valores hardcodeados porque no se calculan en el analyzer. Ver `docs/pending.md` para detalles.
+**Nota:** El flush es time-driven (`flush_expired_windows()` corre cada ≤50ms), por lo que las ventanas de procesos ya matados por la mitigación también se registran. Ver `docs/pending.md` para lo pendiente.
 
 **¿Por qué un hilo separado?** La inferencia ML (aunque sea vía socket local) tiene latencia de 1–5ms. No podemos bloquear la syscall del usuario ese tiempo. El analyzer opera en background: la detección rápida (detector.c) frena el ataque inmediato; el ML da una segunda opinión para refinar.
 

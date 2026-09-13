@@ -14,11 +14,11 @@ Lo necesario para una prueba funcional en VM. Actualizado: 2026-08-08.
 
 Código base ya existe en `src/` (`ml_server.py`, `train_model.py`, cliente en `analyzer.c`).
 
-- [ ] Generar dataset de features (CSV): ventanas benignas `label=0`; ataques solo para eval
-- [ ] Export FUSE/analyzer → CSV de 14 features (hoy no hay exporter)
-- [ ] Entrenar: `python3 src/train_model.py` con `data/features_labeled.csv`
-- [ ] Modelos en `/var/lib/guardian/models/` y levantar `python3 src/ml_server.py` antes/junto al mount
-- [ ] Completar features parciales en `analyzer.c` (varias van en 0.0 hoy: std, autocorr, chi2, etc.)
+- [x] Generar dataset de features (CSV): `scripts/collect_training_data.sh [rounds]` — dos fases (label 1: ataques variados / label 0: workloads benignos), integrado en `test_ml_pipeline.sh`
+- [x] Export FUSE/analyzer → CSV de 14 features — `ml_proxy.py` loggea en `data/training_data.csv`; `analyzer.c` las calcula todas
+- [ ] Entrenar: `python3 src/train_model.py` con `data/training_data.csv` (recolectar ≥100 rondas por clase primero)
+- [ ] Modelos en `/var/lib/guardian/models/` (requiere sudo) y levantar `python3 src/ml_server.py` antes/junto al mount
+- [x] Completar features en `analyzer.c` — 14/14 reales desde 12/09/2026 (std, autocorr, chi2 ≥256B, rw_ratio, ext_change, canary, unique_dirs, file_type_variety)
 - [ ] Liberar slots de `pid_table` cuando mueren procesos (tope 128)
 
 ## Testing

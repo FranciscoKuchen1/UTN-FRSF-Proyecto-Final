@@ -275,7 +275,7 @@ family_photos_2024.jpg
 
 **Inicialización:**
 1. `detector_init(WINDOW_SECS, ENTROPY_THRESHOLD, WRITE_RATE_THRESH, RENAME_THRESH)`
-2. `canary_init("/zpool/data")` — ⚠️ path hardcodeado
+2. `canary_init(gstate.real_root)` — los canaries se siembran en el root real (visibles vía FUSE)
 3. `ring_buf_create(65536, sizeof(io_event_t))` — buffer de 64K eventos
 4. `pthread_create(&analyzer_tid, NULL, analyzer_thread, &gstate)`
 5. `canary_deploy(ctx, 20)` — siembra 20 archivos señuelo
@@ -303,7 +303,7 @@ write(path, buf, size, offset)
   └─ return n (bytes escritos reales)
 ```
 
-**⚠️ Pendiente para VM:** Paths hardcodeados (`/zpool/data`, `tank/data`). No lee `configs/guardian.conf`. Sin handler de SIGTERM/SIGINT para shutdown graceful.
+**⚠️ Pendiente para VM:** `GUARDIAN_ZFS_DATASET` defaultea a `tank/data` y no se lee `configs/guardian.conf`. Sin handler de SIGTERM/SIGINT para shutdown graceful. (El canary ya usa `real_root` desde `GUARDIAN_REAL_ROOT`; fix 12/09/2026.)
 
 **Estado:** ✅ Compila con libfuse3-dev. Estructuralmente completo.
 
