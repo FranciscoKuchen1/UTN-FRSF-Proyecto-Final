@@ -159,33 +159,39 @@ Guardian FS es un sistema de detección y mitigación de ransomware cifrador (cr
 
 ```
 detector_ctx
-├── pids[] → pid_state_t
+├── pids[] → pid_state_t (tope 256; inactivos >30s se liberan)
 │   ├── pid, write_count, bytes_written
-│   ├── rename_count, unlink_count, read_count
+│   ├── rename_count, unlink_count
 │   ├── entropy_sum, entropy_max, entropy_samples
-│   ├── canary_triggered, ext_change_count
-│   ├── byte_hist[256], byte_hist_total
+│   ├── chi2_sum, chi2_samples (χ² medio por ventana)
+│   ├── canary_triggered, canary_reads
 │   ├── score (último calculado)
 │   ├── verdict, attack_confirmed
-│   └── window_start_ns
+│   ├── window_start_ns, last_event_ns, starttime
 ├── lock (pthread_mutex_t)
-├── umbrales (entropy_thresh, write_rate_thresh, rename_thresh, window_secs)
-├── pesos (w_entropy=0.35, w_write=0.20, w_rename=0.15, w_chi2=0.20, w_rw_ratio=0.10)
+├── umbrales (entropy_thresh, write_rate_thresh, rename_thresh, unlink_thresh, window_secs)
+├── pesos (w_entropy=0.35, w_write=0.20, w_rename=0.15, w_chi2=0.20, w_unlink=0.10)
 ├── score_thresh = 0.65  (≥ → VERDICT_BLOCK)
-└── warn_threshold = 0.45 (≥ → VERDICT_SUSPICIOUS)
+├── warn_threshold = 0.45 (≥ → VERDICT_SUSPICIOUS)
+└── freno global: hent_writes/ext_changes agregados por ventana
+    (≥100 writes con firma de cifrado o ≥60 ext-changes → brake_armed)
 ```
 
 **Ecuación de score:**
 
 ```
 score = 0.35 · f(entropy) + 0.20 · f(write_rate) + 0.15 · f(rename_rate)
-      + 0.20 · f(χ²) + 0.10 · f(rw_ratio)
-      + 0.50 si canary_triggered (en gfs_write)
-      + 0.80 en detector_signal_canary() (override fuerte)
+      + 0.20 · f(χ² medio) + 0.10 · f(unlink_rate)
       + ext_change_count · 0.4 en detector_check_rename()
+      + VERDICT_BLOCK directo si attack_confirmed
+      + VERDICT_BLOCK si canary armado y la escritura tiene firma de cifrado
+      + VERDICT_BLOCK por freno global (escritores con firma de cifrado)
 ```
 
-Donde cada f(x) está normalizada a [0, 1].
+Donde cada f(x) está normalizada a [0, 1]. El ratio lectura/escritura se
+evalúa solo en el camino async (features ML), no en el score síncrono.
+La firma de cifrado = entropía > umbral **y** χ² < 300 (uniforme) — un
+`.jpg`/`.zip` comprimido no cuenta (anti-FP del freno global).
 
 **Regla rápida adicional:** Si `entropy > entropy_thresh` Y `write_count > 20` en la misma ventana → `VERDICT_SUSPICIOUS` inmediato, sin esperar al score completo.
 
@@ -209,7 +215,8 @@ Donde cada f(x) está normalizada a [0, 1].
 - Nombres con prefijos `A_` y `ZZ_` para explotar orden alfabético.
 - Extensiones objetivo: `.docx`, `.pdf`, `.jpg`, `.xlsx`.
 - Contenido simulado de baja entropía (texto plano con datos financieros ficticios).
-- Hasta 7 plantillas de nombres disponibles, hasta 20 canaries desplegables.
+- 7 plantillas de nombres, rotadas con sufijo `_N` si `count > 7`.
+- Distribuidos entre la raíz y los subdirectorios `docs/`, `finanzas/`, `backup/`.
 - Contenido aparenta ser real (~4 KB de datos plausibles por archivo).
 
 **Canary names definidos:**
@@ -233,13 +240,13 @@ family_photos_2024.jpg
 
 | Función | Propósito | Método |
 |---|---|---|
-| `zfs_snapshot_emergency()` | Snapshot inmediato en ataque | `system("zfs snapshot ...@guardian_emergency_<timestamp>")` |
+| `zfs_snapshot_emergency()` | Snapshot en el primer WARN y en cada bloqueo | **Asíncrona**: worker thread + dedup por cooldown (10s). El handler FUSE solo señaliza (µs) |
 | `zfs_snapshot_schedule()` | Hilo de snapshots periódicos | `pthread_create` + `sleep(interval)` |
-| `zfs_rollback_latest()` | Rollback al snapshot pre-ataque | `popen("zfs list ... grep ... | tail -1")` + `zfs rollback -r` |
+| `zfs_rollback_latest()` | Rollback al snapshot pre-ataque | Lista snapshots (pipe + spawn, sin shell) y hace `zfs rollback -r` del más reciente |
 
-**Política de retención:** Últimos 20 snapshots automáticos; el resto se destruyen.
+**Política de retención:** Últimos 20 snapshots automáticos y últimos 10 de emergencia; el resto se destruyen.
 
-**Nota:** Para la PoC se usa `system()`/`popen()` invocando el binario `zfs`. En producción se recomienda usar `libzfs` directamente para mayor control de errores.
+**Nota:** Todas las invocaciones de `zfs(8)` van por `posix_spawnp` con argv directo (sin shell — `system()`/`popen` interpolaban strings: riesgo de inyección + fork+shell en el hot path). En producción se recomienda `libzfs` directa para mayor control de errores.
 
 **Estado:** ✅ Compila con 0 warnings.
 
@@ -253,11 +260,11 @@ family_photos_2024.jpg
 | Operación FUSE | Handler | Comportamiento de seguridad |
 |---|---|---|
 | `getattr` | `gfs_getattr` | Proxy directo a `lstat()` |
-| `open` | `gfs_open` | Detecta apertura de canary → `detector_signal_canary()` |
+| `open` | `gfs_open` | Canary con intención de escritura (`O_WRONLY`/`O_RDWR`) → `detector_signal_canary()` (arma el bloqueo); canary read-only (backup/tar/AV) → señal leve, **no arma el kill** |
 | `read` | `gfs_read` | Registra evento de lectura (para ratio R/W) |
-| `write` | `gfs_write` | Calcula entropía, evalúa detector, bloquea si es necesario |
-| `rename` | `gfs_rename` | Detecta cambio de extensión (`.doc` → `.locked`) |
-| `unlink` | `gfs_unlink` | Si es canary → bloqueo inmediato + snapshot + kill |
+| `write` | `gfs_write` | Calcula entropía, evalúa detector, bloquea si es necesario; en WARN dispara snapshot temprano (pre-daño) |
+| `rename` | `gfs_rename` | Detecta cambio de extensión (`.doc` → `.locked`); renombrar canary con cambio de extensión → señal fuerte |
+| `unlink` | `gfs_unlink` | Si es canary → bloqueo + confirmación; si no, alimenta el score de caza de backups (`detector_check_unlink`); puede bloquear combinado con otras señales |
 | `readdir` | `gfs_readdir` | Proxy vía `opendir()`/`readdir()`/`closedir()` |
 | `mkdir` | `gfs_mkdir` | Proxy directo a `mkdir()` |
 | `create` | `gfs_create` | Proxy con `open(O_CREAT)`, guarda fd en `fi->fh` |
@@ -290,14 +297,19 @@ write(path, buf, size, offset)
   │
   ├─ 2. ring_buf_push(evbuf, event{EV_WRITE, pid, size, ent})
   │
-  ├─ 3. detector_check_write(ctx, pid, path, ent, size) → verdict
+  ├─ 3. detector_check_write(ctx, pid, path, ent, size, chi2) → verdict
   │      │
   │      ├─ VERDICT_BLOCK:
-  │      │   ├─ zfs_snapshot_emergency(zfs_dataset)
-  │      │   ├─ mitigation_kill_process(pid)
+  │      │   ├─ log write_blocked
+  │      │   ├─ zfs_snapshot_emergency() (async, dedup por cooldown)
+  │      │   ├─ mitigate_and_log(pid) — verifica starttime, kill, log
   │      │   └─ return -EPERM
   │      │
-  │      └─ VERDICT_NORMAL / SUSPICIOUS:
+  │      ├─ VERDICT_SUSPICIOUS:
+  │      │   ├─ zfs_snapshot_emergency() (snapshot temprano pre-daño)
+  │      │   └─ log write_suspicious (rate-limit 1/s)
+  │      │
+  │      └─ VERDICT_NORMAL:
   │          └─ pwrite(fi->fh, buf, size, offset) → ZFS real
   │
   └─ return n (bytes escritos reales)
@@ -389,7 +401,7 @@ python3 src/train_model.py
 | Módulo | Archivo | Header | Líneas | Propósito |
 |---|---|---|---|---|
 | **ring_buffer** | `src/ring_buffer.c` | `include/ring_buffer.h` | 81 | Buffer circular thread-safe con mutex + condition variables. Push/Pop bloqueantes + try_pop no bloqueante. Capacidad 64K eventos `io_event_t`. |
-| **mitigation** | `src/mitigation.c` | `include/mitigation.h` | 16 | `mitigation_kill_process(pid)` — envía SIGKILL al proceso atacante. |
+| **mitigation** | `src/mitigation.c` | `include/mitigation.h` | 16 | `mitigation_kill_process(pid, expected_starttime)` — verifica identidad del PID vía `/proc/<pid>/stat` (starttime) antes del SIGKILL; omite el kill si el PID fue reutilizado. Resultados: `MIT_KILLED` / `MIT_NO_PROCESS` / `MIT_PID_REUSED` / `MIT_KILL_FAILED`. |
 | **analyzer** | `src/analyzer.c` | `include/analyzer.h` | 245 | `analyzer_thread()` — hilo background que consume eventos del ring buffer vía `ring_buf_try_pop()`, acumula estadísticas por PID en ventanas de 5s, conecta a ML server vía Unix socket, reintenta conexión cada 5s si falla. |
 
 **Tests asociados:**
@@ -476,7 +488,8 @@ analyzer_thread (segundo plano):
   │   ├─ Envía JSON: {"features": {...}, "pid": 1234}
   │   ├─ Recibe JSON: {"p_attack": 0.89, "verdict": "attack", ...}
   │   ├─ Si verdict == "attack": llama a detector_confirm_attack()
-  │   └─ Resetea contadores de ventana
+  │   │    → las siguientes write/rename del PID reciben VERDICT_BLOCK
+  │   └─ Resetea contadores de ventana (o libera el slot si el PID quedó inactivo)
   └─ Sin ML: solo rota ventanas y acumula stats (detección estadística pura)
 ```
 

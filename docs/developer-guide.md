@@ -159,7 +159,7 @@ Aplicación (usuario o ransomware)
 | `write` | `gfs_write` | Calcula entropía → detector → bloquea o permite |
 | `rename` | `gfs_rename` | Detecta cambio de extensión → scoring |
 | `unlink` | `gfs_unlink` | Si es canary → bloqueo inmediato |
-| `open` | `gfs_open` | Si es canary → alerta |
+| `open` | `gfs_open` | Si es canary: apertura para escritura → alerta fuerte; read-only → nota leve (anti-FP de backups) |
 | `read` | `gfs_read` | Registra evento (para ratio R/W) |
 | `getattr`, `readdir`, `mkdir`, `create`, `release`, `truncate` | Proxy directo | Pasan al filesystem subyacente sin análisis |
 
@@ -202,7 +202,7 @@ Aplicación (usuario o ransomware)
 | `entropy_chi_square(buf, len)` | Test χ² de bondad de ajuste a distribución uniforme. | **Cercano a 0** = muy uniforme → cifrado. **Alto** = distribución sesgada → datos normales. |
 | `entropy_sliding_window(buf, len, block_sz)` | Entropía por bloques de N bytes. | Detecta cifrado parcial (ransomware que solo cifra los primeros KB de cada archivo). |
 | `entropy_autocorrelation(H[], n)` | Correlación de Pearson lag-1 entre entropías consecutivas. | **Baja** = cada bloque es independiente → cifrado. **Alta** = datos con estructura → normal. |
-| `entropy_chi2_from_hist(hist[256], total)` | χ² desde histograma precomputado. | Igual que `entropy_chi_square` pero trabajando sobre un histograma acumulado por PID (ventana de tiempo). |
+| `entropy_chi2_from_hist(hist[256], total)` | χ² desde histograma precomputado. | Igual que `entropy_chi_square` pero sobre un histograma ya calculado (usada por tests; el detector acumula χ² por escritura vía `chi2_sum`/`chi2_samples`). |
 
 **¿Por qué estas 5 y no otras?**
 
@@ -224,19 +224,19 @@ Aplicación (usuario o ransomware)
 
 ```
 detector_ctx
-├── pids[] → pid_state_t    (uno por cada PID observado)
+├── pids[] → pid_state_t    (uno por cada PID observado, tope 256,
+│   │                          inactivos >30s se liberan)
 │   ├── Métricas de escritura: write_count, bytes_written
 │   ├── Métricas de entropía: entropy_sum, entropy_max, entropy_samples
 │   ├── Métricas de rename:  rename_count, ext_change_count
-│   ├── Métricas de lectura: read_count, bytes_read
+│   ├── χ² por escritura:    chi2_sum, chi2_samples (media por ventana)
 │   ├── Canary:              canary_triggered
-│   ├── Histograma χ²:       byte_hist[256], byte_hist_total
-│   ├── Ventana temporal:    window_start_ns
-│   └── Veredicto actual:    score, verdict
+│   ├── Ventana temporal:    window_start_ns, last_event_ns
+│   └── Veredicto actual:    score, verdict, attack_confirmed
 ├── lock (pthread_mutex_t)  → thread-safe
 └── Configuración:
     ├── Pesos: w_entropy=0.35, w_write=0.20, w_rename=0.15,
-    │          w_chi2=0.20, w_rw_ratio=0.10
+    │          w_chi2=0.20, w_unlink=0.10
     ├── Umbrales: score_thresh=0.65 (BLOCK), warn=0.45 (SUSPICIOUS)
     └── Parámetros: window_secs, entropy_thresh, write_thresh, rename_thresh
 ```
@@ -247,21 +247,23 @@ detector_ctx
 score = 0.35 · f(entropía media)
       + 0.20 · f(tasa de escrituras/ventana)
       + 0.15 · f(tasa de renombrados/ventana)
-      + 0.20 · f(test χ² de uniformidad)
-      + 0.10 · f(ratio lectura/escritura)
+      + 0.20 · f(χ² medio de uniformidad)
+      + 0.10 · f(tasa de unlinks/ventana)        ← caza de backups
 ```
 
-Cada `f(x)` es una función de normalización que mapea la señal cruda al rango [0, 1]. Por ejemplo, entropía se normaliza como `(H - 5.0) / 3.0` (5.0→0, 8.0→1).
+Cada `f(x)` es una función de normalización que mapea la señal cruda al rango [0, 1]. Por ejemplo, entropía se normaliza como `(H - 5.0) / 3.0` (5.0→0, 8.0→1). El ratio lectura/escritura **no** participa del score síncrono: los `EV_READ` no llegan al detector, se evalúa en el camino async (`analyzer.c` → features ML, `read_write_ratio`).
 
 **¿Por qué estos pesos?**
 
 | Señal | Peso | Justificación |
 |---|---|---|
 | Entropía | 0.35 | Es la señal más fuerte — el cifrado siempre produce alta entropía. |
+| χ² uniformidad | 0.20 | Compresión también tiene alta entropía, pero su distribución NO es perfectamente uniforme. χ² bajo = cifrado real. Sin esta señal, el score máximo de un ataque entropy-only queda en 0.55 (< 0.65) y nunca bloquea. |
 | Tasa escrituras | 0.20 | Ransomware escribe agresivamente; un proceso normal no escribe 500+ veces en 5 segundos. |
-| χ² uniformidad | 0.20 | Compresión también tiene alta entropía, pero su distribución NO es perfectamente uniforme. χ² bajo = cifrado real. |
 | Renombrados | 0.15 | Cambiar `.docx` → `.locked` es comportamiento clásico de ransomware. |
-| Ratio R/W | 0.10 | Ransomware lee y luego escribe (encrypt-in-place). Un backup solo lee. |
+| Tasa unlinks | 0.10 | Caza de backups: análogo Linux del `vssadmin delete shadows` de Windows (borrar backups antes/después de cifrar). Sola no bloquea: un `rm -rf` benigno (`make clean`) aporta máximo 0.10 < 0.65. |
+
+**Freno global (anti-evasión multiproceso):** un ransomware que forkea N workers diluye el scoring per-PID (cada worker queda bajo todos los umbrales). El detector agrega en la ventana la tasa de escrituras con **firma de cifrado** (entropía alta **y** χ² uniforme — un `.jpg`/`.zip` comprimido tiene alta entropía pero χ² alto, no cuenta) de todos los PIDs: ≥100 en la ventana arma el freno y los escritores con firma de cifrado reciben `VERDICT_BLOCK` aunque su score individual sea bajo. Un writer benigno de baja entropía nunca es bloqueado por el freno. Lo mismo aplica a renames con cambio de extensión (≥60/ventana). Los eventos de bloqueo se loguean con `"brake":1`.
 
 **Regla rápida adicional:** Si `entropy > umbral` **Y** `write_count > 20` en la misma ventana → `VERDICT_SUSPICIOUS` inmediato. Esto atrapa ransomware agresivo en los primeros 20 archivos, sin esperar a que el score acumulado cruce 0.65.
 
@@ -295,10 +297,12 @@ Cada `f(x)` es una función de normalización que mapea la señal cruda al rango
 
 **Contenido:** Los archivos contienen ~4 KB de texto plano falso (reportes financieros ficticios) con baja entropía. Esto es deliberado: si un canary tuviera alta entropía, el ransomware podría confundirlo con un archivo ya cifrado y saltearlo.
 
-**Detección en varias capas:**
-- `gfs_open()` — si el proceso abre un canary → `detector_signal_canary()` (score +0.8).
-- `gfs_write()` — si el canary fue señalizado antes → bloqueo inmediato.
-- `gfs_unlink()` — si el proceso **elimina** un canary → bloqueo inmediato sin esperar scoring.
+**Detección en varias capas (con discriminación por intención):**
+- `gfs_open()` — abrir un canary **para escritura** (`O_WRONLY`/`O_RDWR`) → `detector_signal_canary()` arma la señal. Un ransomware abre los canaries para cifrarlos.
+- `gfs_open()` — abrir un canary **read-only** (tar, `cp -r`, rsync, thumbnailers, AV) → `detector_note_canary_read()`: señal leve (+0.05/read, tope +0.15 por ventana), **no arma el kill**. Sin esta discriminación, un `cp -r` dentro del mount que toca un canary moría en su próxima escritura.
+- `gfs_rename()` — renombrar un canary **con cambio de extensión** (`.docx` → `.locked`) → señal fuerte. Moverlo sin cambiar extensión → señal leve (un usuario reorganizando archivos).
+- `gfs_write()` — la señal armada bloquea solo escrituras con **firma de cifrado** (entropía > umbral): un usuario editando el señuelo (texto de baja entropía, autosave, temporales del editor) no es bloqueado; el ransomware que cifra tras tocar el canary, sí.
+- `gfs_unlink()` — si el proceso **elimina** un canary → bloqueo inmediato sin esperar scoring. Los unlinks de archivos normales alimentan la señal de caza de backups (w_unlink en el score).
 
 ### 4.5 zfs_snap.c — Recuperación vía Snapshots ZFS
 
@@ -317,11 +321,11 @@ Cada `f(x)` es una función de normalización que mapea la señal cruda al rango
 
 | Función | Cuándo se usa | Qué hace |
 |---|---|---|
-| `zfs_snapshot_emergency()` | En el instante del bloqueo | Snapshot inmediato etiquetado `@guardian_emergency_<timestamp>`. Preserva el estado pre-ataque. |
+| `zfs_snapshot_emergency()` | Primer WARN y cada bloqueo | **Asíncrona** (worker thread): el handler FUSE solo señaliza (µs). Dedup por cooldown de 10s — un ataque sostenido no genera más de uno por cooldown. Etiquetada `@guardian_emergency_<timestamp>`, retiene los últimos 10. |
 | `zfs_snapshot_schedule()` | Hilo background, cada 60s | Snapshots periódicos `@guardian_auto_<timestamp>`. Retiene los últimos 20. |
 | `zfs_rollback_latest()` | Manual (administrador) | Recupera el filesystem al snapshot más reciente con el prefijo dado. |
 
-**Nota de implementación:** Para la PoC usamos `system()` y `popen()` invocando el binario `zfs`. En producción se recomienda usar `libzfs` directamente para mejor manejo de errores y performance.
+**Nota de implementación:** Todas las invocaciones de `zfs(8)` van por `posix_spawnp` con argv directo — **sin shell** (`system()`/`popen` interpolaban strings en comandos shell: riesgo de inyección y costo de fork+shell en el hot path). En producción se recomienda `libzfs` directa para mejor manejo de errores y performance.
 
 ### 4.6 ring_buffer.c — Buffer Circular Thread-Safe
 
@@ -353,6 +357,8 @@ void ring_buf_destroy(rb);
 
 **¿Por qué matar el proceso?** Bloquear la syscall con `-EPERM` detiene **esa** escritura, pero el ransomware va a reintentar o pasar al siguiente archivo. Matar el proceso corta el ataque de raíz.
 
+**Verificación de identidad (anti PID-reuse):** antes del `SIGKILL` se compara el `starttime` actual del PID (campo 22 de `/proc/<pid>/stat`) con el registrado por el detector al crear la entrada. Si difiere, el PID fue reutilizado por otro proceso → el kill se **omite** (`MIT_PID_REUSED`) y el estado envenenado del PID se descarta (`detector_reset_pid`). Esto importa en el camino async: un veredicto ML "attack" llega hasta 5s después de los eventos — si el atacante murió y su PID fue reutilizado en esa ventana, sin esta verificación mataríamos a un inocente. El resultado del kill va al log estructurado (`process_killed` / `kill_skipped`).
+
 ### 4.8 analyzer.c — Hilo de Análisis Asíncrono
 
 **Archivo:** `src/analyzer.c` (245 líneas)  
@@ -365,7 +371,7 @@ void ring_buf_destroy(rb);
 4. Conecta al servidor ML (`/tmp/guardian_ml.sock`) al iniciar.
 5. Si la conexión falla, reintenta cada 5 segundos mientras no haya eventos.
 6. Cuando la ventana expira y hay suficientes escrituras (>=10), construye un feature vector de 14 dimensiones y lo envía al ML server.
-7. Si el ML server responde con veredicto "attack", llama a `detector_confirm_attack()` para marcar el PID como atacante confirmado.
+7. Si el ML server responde con veredicto "attack", llama a `detector_confirm_attack()` — las siguientes write/rename de ese PID reciben `VERDICT_BLOCK` (el camino async tiene poder de enforcement real).
 8. Si el ML server no está disponible, solo rota ventanas sin enviar features (detección estadística pura).
 
 **Features enviadas al ML server (14/14 calculadas):**
@@ -400,8 +406,8 @@ T0 + 3μs:  detector_check_write(pid=1234, path="...docx", entropy=7.94, size=40
               ├─ compute_score():
               │    f_entropy = (7.94-5.0)/3.0 = 0.98
               │    f_write   = 19/500 = 0.038
-              │    score = 0.35·0.98 + 0.20·0.038 = 0.35
-              ├─ score(0.35) < 0.45 → VERDICT_NORMAL
+              │    score = 0.40·0.98 + 0.20·0.038 = 0.40
+              ├─ score(0.40) < 0.45 → VERDICT_NORMAL
               └─ return VERDICT_NORMAL
 T0 + 4μs:  pwrite(fd, bytes_cifrados, 4096) → disco ZFS
 

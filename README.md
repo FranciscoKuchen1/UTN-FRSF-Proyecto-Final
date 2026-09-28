@@ -110,6 +110,7 @@ Variables de entorno que usa el daemon:
 | `GUARDIAN_REAL_ROOT` | `/zpool/data` | Backend real (la setea `mount.sh`) |
 | `GUARDIAN_ZFS_DATASET` | `tank/data` | Dataset para snapshots |
 | `GUARDIAN_LOG_PATH` | `/var/log/guardian/events.jsonl` | Log JSONL de eventos |
+| `GUARDIAN_SHADOW_MODE` | off | `1` = registrar veredictos sin bloquear/kill/snapshot (recolección de datos y medición de FPs) |
 
 Verificación:
 
@@ -178,10 +179,10 @@ Formato esperado por `src/train_model.py`:
 entropy_mean,entropy_max,entropy_std,entropy_autocorr,
 write_rate,bytes_written_rate,rename_rate,unlink_rate,
 read_write_ratio,chi2_stat,ext_change_rate,canary_accessed,
-unique_dirs,file_type_variety,label
+unique_dirs,file_type_variety,label,session,timestamp,pid
 ```
 
-`label`: `0` = benigno, `1` = ataque.
+`label`: `0` = benigno, `1` = ataque. `session` (agregada por `ml_proxy.py --tag`) identifica la ronda de recolección: `train_model.py` evalúa agrupado por sesión (`StratifiedGroupKFold`) para evitar leakage entre train y test.
 
 ```bash
 # Desde la raíz del repo, con el CSV en data/features_labeled.csv
@@ -214,6 +215,10 @@ python3 scripts/simulate_ransomware.py --target-dir /mnt/protected
 
 python3 scripts/simulate_ransomware.py --target-dir /mnt/protected \
   --mode stealth --file-count 20 --pause-ms 200
+
+# Ataque realista: 4 workers paralelos + cifrado parcial (estilo LockBit)
+python3 scripts/simulate_ransomware.py --target-dir /mnt/protected \
+  --workers 4 --partial-encrypt 50 --realistic
 ```
 
 ---

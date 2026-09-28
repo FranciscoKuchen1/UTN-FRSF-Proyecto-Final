@@ -53,15 +53,17 @@ El detector estadístico (`detector.c`) usa umbrales fijos calibrados con razona
 │       ▼                                                  │
 │  ┌──────────────────────────────────────────────────┐   │
 │  │              train_model.py                       │   │
+│  │  (misma clase que sirve inferencia:               │   │
+│  │   RansomwareDetector de ml_server.py)             │   │
 │  │                                                   │   │
-│  │  1. SMOTE (balanceo de clases)                    │   │
-│  │  2. StandardScaler (normalización)                │   │
-│  │  3. StratifiedKFold k=10                          │   │
-│  │  4. Entrenar 3 modelos:                           │   │
+│  │  1. StratifiedGroupKFold por sesión (sin SMOTE)   │   │
+│  │  2. StandardScaler DENTRO del Pipeline del CV    │   │
+│  │  3. Entrenar (class_weight/scale_pos_weight):     │   │
 │  │     ├─ RandomForest (n=200, depth=15)             │   │
-│  │     ├─ XGBoost (n=200, depth=8)                   │   │
-│  │     └─ IsolationForest (contamination=0.01)       │   │
-│  │  5. Serializar: scaler.pkl, rf.pkl, xgb.json     │   │
+│  │     ├─ XGBoost (n=200, depth=8)                  │   │
+│  │     └─ IsolationForest (solo clase benigna)      │   │
+│  │  4. Serializar: scaler.pkl, rf.pkl,               │   │
+│  │     iso_forest.pkl, xgb.json                      │   │
 │  └──────────────────────────────────────────────────┘   │
 │                                                          │
 │  LSTM (si se usa):                                       │
@@ -286,30 +288,30 @@ Los pesos reflejan:
 features_labeled.csv
       │
       ├─ 1. Carga y validación
-      │     └─ Verificar: 14 columnas de features + columna 'label' (0=benigno, 1=ataque)
+      │     └─ Verificar: 14 columnas de features + label + session (ronda de recolección)
       │     └─ Verificar: no hay nulos, no hay infinitos
+      │     └─ Grupos = sesión (sin columna session: se deriva por gaps de timestamp)
       │
-      ├─ 2. Split estratificado
-      │     └─ train_test_split(test_size=0.2, stratify=y)
-      │     └─ El split es estratificado porque el dataset está muy desbalanceado
+      ├─ 2. Validación cruzada agrupada por sesión
+      │     └─ StratifiedGroupKFold(5 folds, groups=session)
+      │     └─ Las ventanas de una misma sesión/ronda NO se mezclan entre
+      │        train y test (el CV aleatorio medía leakage temporal)
+      │     └─ StandardScaler DENTRO del Pipeline (fit solo con el fold
+      │        de train — antes se escalaba todo antes del CV)
       │
-      ├─ 3. Balanceo de clases (SMOTE)
-      │     └─ SMOTE(random_state=42) sobre el conjunto de entrenamiento
-      │     └─ Genera ejemplos sintéticos de la clase minoritaria (ataque)
-      │     └─ NO aplicar SMOTE al conjunto de test (data leakage)
+      ├─ 3. Balanceo de clases: SIN SMOTE
+      │     └─ class_weight='balanced' (RF) + scale_pos_weight (XGBoost)
+      │     └─ SMOTE interpolaba features binarias/count
+      │        (canary_accessed=0.37 no significa nada) y sintetizaba
+      │        muestras dentro de los folds de test (leakage)
       │
-      ├─ 4. Normalización (StandardScaler)
-      │     └─ fit() solo en train, transform() en train y test
-      │     └─ Guardar scaler.pkl para usar en inferencia
+      ├─ 4. Holdout agrupado (GroupShuffleSplit 25%)
+      │     └─ classification_report + ROC-AUC + FPR/FNR
       │
-      ├─ 5. Validación cruzada estratificada
-      │     └─ StratifiedKFold(n_splits=10, shuffle=True)
-      │     └─ Para RF y XGBoost: GridSearchCV sobre hiperparámetros
-      │
-      ├─ 6. Entrenamiento final
+      ├─ 5. Entrenamiento final (todo el dataset, RansomwareDetector.train)
       │     ├─ RandomForestClassifier → rf.pkl
       │     ├─ XGBClassifier → xgb.json
-      │     ├─ IsolationForest (solo datos benignos) → iso.pkl
+      │     ├─ IsolationForest (solo datos benignos) → iso_forest.pkl
       │     └─ LSTM (secuencias de 10 ventanas) → lstm.pt
       │
       └─ 7. Evaluación
@@ -324,13 +326,15 @@ features_labeled.csv
 
 El dataset va a estar **fuertemente desbalanceado**: quizás 10,000 muestras benignas por cada 100 de ataque. Si entrenamos sin balancear, el modelo aprende a decir siempre "benigno" y tiene 99% de accuracy — inútil.
 
-**Estrategia de 3 capas:**
+**Estrategia (pesos de clase, sin oversampling sintético):**
 
-1. **SMOTE** (Synthetic Minority Oversampling Technique): genera ejemplos sintéticos de ataque interpolando entre ejemplos reales cercanos en el espacio de features. No duplica, crea variaciones plausibles.
+1. **class_weight='balanced'** en Random Forest: penaliza más los errores en la clase minoritaria.
 
-2. **class_weight='balanced'** en Random Forest: penaliza más los errores en la clase minoritaria.
+2. **scale_pos_weight=10** en XGBoost: 10x más penalización por falso negativo que por falso positivo. Un ataque no detectado cuesta más que una falsa alarma.
 
-3. **scale_pos_weight=10** en XGBoost: 10x más penalización por falso negativo que por falso positivo. Un ataque no detectado cuesta más que una falsa alarma.
+3. **IsolationForest** solo con la clase benigna (detección de anomalía): no necesita ejemplos de ataque.
+
+SMOTE se retiró: interpolaba features binarias/count (`canary_accessed=0.37` no significa nada) y sintetizaba muestras dentro de los folds de test (leakage → métricas infladas). El desbalance se maneja con los pesos de clase de arriba.
 
 ---
 
@@ -358,7 +362,7 @@ entropy_mean,entropy_max,entropy_std,entropy_autocorr,write_rate,bytes_written_r
 | **Benigno (0)** | 5,000 | 50,000+ | Capturar en entorno real: editores de texto, navegadores, compiladores, backups, rsync, tar, gzip, git, builds, IDEs. |
 | **Ataque (1)** | 500 | 5,000+ | Ejecutar muestras de ransomware conocido en entorno controlado (VM aislada). Alternativa: simular comportamiento de ransomware con scripts. |
 
-**IMPORTANTE:** No usar datos sintéticos para la clase de ataque si es posible. SMOTE ya genera síntesis durante el entrenamiento. El dataset de ataque debe ser real (ransomware ejecutado en sandbox) o al menos simulación fiel (script que replica el comportamiento de E/S del ransomware).
+**IMPORTANTE:** No usar datos sintéticos para la clase de ataque. El dataset de ataque debe ser real (ransomware ejecutado en sandbox) o al menos simulación fiel (script que replica el comportamiento de E/S del ransomware — `simulate_ransomware.py` con perfiles de familias reales). El balance de clases se maneja con pesos, no con oversampling.
 
 ### 6.3 Recolección de datos benignos
 
@@ -594,13 +598,12 @@ Ver `python/requirements.txt`:
 
 ```
 numpy>=1.24           # cómputo numérico
-scikit-learn>=1.3     # RF, IsolationForest, StandardScaler, SMOTE
+scikit-learn>=1.3     # RF, IsolationForest, StandardScaler, StratifiedGroupKFold
 xgboost>=2.0          # gradient boosting
 joblib>=1.3           # serialización de modelos
 pandas>=2.0           # carga y manipulación de datos
-imbalanced-learn>=0.11 # SMOTE
 matplotlib>=3.7       # visualización (evaluación)
-# torch>=2.0          # opcional: LSTM
+# torch>=2.0          # opcional: LSTM (solo si hay checkpoint lstm.pt entrenado)
 ```
 
 ---

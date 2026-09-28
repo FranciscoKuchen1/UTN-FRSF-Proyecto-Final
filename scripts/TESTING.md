@@ -36,8 +36,10 @@ Levanta su propio stack (ml_server + ml_proxy + FUSE) y recolecta datos de ambas
 ```
 
 **Fases:**
-- **Fase 1 (label 1)**: `rounds` corridas del simulador de ransomware variando `--mode` (full/fast/stealth), `--file-count` (30-79), `--pause-ms` (0/20/40) y cada 4ª ronda `--no-rename` (detección solo por entropía). Cada corrida genera ~1 fila (el simulador es matado por la mitigación en la primera ventana).
-- **Fase 2 (label 0)**: reinicia el proxy con label 0 y corre `rounds` workloads benignos (copias de src/ y docs/, tar.gz, appends a log, CSVs, copia de binario). Cada ronda genera 1-2 filas (ventanas de 5s con ≥10 writes).
+- **Fase 1 (label 1)**: `rounds` corridas del simulador variando `--mode` (full/fast/stealth), `--file-count` (30-79), `--pause-ms` (0/20/40), `--workers` (1-4), `--partial-encrypt` (50-100%) y cada 4ª ronda `--no-rename` (detección solo por entropía); rondas impares con `--realistic`. Corre en **shadow mode** (sin kill) → cada ataque aporta features de TODAS sus ventanas (no solo la primera).
+- **Fase 2 (label 0)**: `rounds` workloads benignos (copias de src/ y docs/, tar.gz, appends a log, CSVs, copia de binario). Ventanas de 5s con ≥10 writes.
+
+**Proxy por ronda con `--tag atk_rN`/`ben_rN`** → columna `session` del CSV: `train_model.py` evalúa con `StratifiedGroupKFold` por sesión (sin leakage de ventanas contiguas entre train y test).
 
 Todo opera sobre `/tmp/guardian_collect_*` — no toca datos reales. Requiere proyecto compilado y venv (correr `test_ml_pipeline.sh` una vez antes).
 
@@ -64,6 +66,59 @@ Limpia procesos, mountpoints (test y collect), sockets y directorios de prueba. 
 ./scripts/cleanup_test.sh
 ```
 
+## Simulador — flags de realismo
+
+`simulate_ransomware.py` calibra sus perfiles con comportamiento documentado de familias reales (LockBit, Cl0p, RansomEXX):
+
+| Flag | Qué simula | Por qué importa |
+|---|---|---|
+| `--workers N` | N procesos paralelos atacando subsets disjuntos | Cada worker = PID propio → **diluye el scoring per-PID** (evasión real de ransomware multi-proceso) |
+| `--partial-encrypt PCT` | Cifra solo los primeros PCT% de cada archivo (intermitente, estilo LockBit) | Menos bytes escritos de alta entropía → pone a prueba los umbrales de tasa |
+| `--realistic` | Tamaños log-uniformes 16KB–8MB, writes en chunks de 256KB, jitter de pausas, ~5% de archivos salteados | Distribuciones de un filesystem real, no payloads planos |
+| `--mmap` | Escribe vía mmap en vez de `write()` | **Prueba de bypass**: mmap no pasa por `gfs_write` → el detector no ve entropía. NO usar para training (no genera features) |
+| `--seed N` | Reproducibilidad de toda la corrida | Runs comparables entre configuraciones |
+
+## Shadow mode (log-only)
+
+`GUARDIAN_SHADOW_MODE=1` (o `true`/`yes`/`on`) hace que el daemon **registre** los veredictos BLOCK sin ejecutar la mitigación (sin EPERM, sin SIGKILL, sin snapshot de emergencia):
+
+- **Recolección de datos**: los ataques generan features de *todas* sus ventanas (no mueren en la primera) → muchas más filas label=1 y más variadas.
+- **Medición de FPs**: correr workloads benignos reales sin riesgo de kills.
+- Los eventos en `events.jsonl` llevan `"mode":"shadow"` para distinguirlos de corridas enforce.
+- `collect_training_data.sh` lo activa por defecto; override con `GUARDIAN_SHADOW_MODE=0`.
+
+## Verificación anti-FP (VM)
+
+Workflows benignos que tocan canaries **no deben morir** (leer canaries
+read-only no arma el kill — un ransomware los abre para ESCRIBIR):
+
+```bash
+# cp dentro del mount: lee canaries read-only, luego escribe copias
+mkdir -p /mnt/protected/docs_copy
+cp -r /mnt/protected/docs /mnt/protected/docs_copy        # debe COMPLETAR
+
+# grep con salida dentro del mount
+grep -r "Confidential" /mnt/protected > /mnt/protected/grep_out.txt   # debe COMPLETAR
+```
+
+El kill ahora verifica identidad: en `events.jsonl` los eventos
+`process_killed` / `kill_skipped` muestran la decisión (`"result":"killed"`,
+`"pid_reused"`, `"already_gone"`). Un ataque debe terminar en `process_killed`;
+un PID reutilizado por un proceso inocente **nunca** recibe SIGKILL.
+
+## Verificación del freno global (VM)
+
+Un ataque multiproceso diluye el scoring per-PID; el freno global lo atrapa
+por el agregado (escrituras con firma de cifrado: entropía alta + χ² uniforme):
+
+```bash
+python3 scripts/simulate_ransomware.py --target-dir /mnt/protected --workers 4
+# Esperado: "GLOBAL BRAKE armed" en el log del daemon + eventos con "brake":1
+grep '"brake":1' /var/log/guardian/events.jsonl | head -3
+```
+
+Un workload benigno de baja entropía durante el freno nunca es bloqueado.
+
 ## Flujo de datos
 
 ```
@@ -85,7 +140,7 @@ analyzer.c recibe veredicto (si la conexión se cae, reconecta cada 5s)
 
 ## Archivos generados
 
-- `data/training_data.csv` — Features loggeadas (14 features + label + timestamp + pid). Es el dataset que consume `src/train_model.py`. Gitignored.
+- `data/training_data.csv` — Features loggeadas (14 features + label + **session** + timestamp + pid). La columna session (ronda de recolección) permite evaluar agrupado por sesión sin leakage. CSVs viejos sin session: `train_model.py` deriva la sesión por gaps de timestamp. Es el dataset que consume `src/train_model.py`. Gitignored.
 - `logs/` — Logs persistentes de cada componente (gitignored, sobreviven reinicios):
   - `ml_server.log`, `ml_proxy.log`, `fuse.log` (test_ml_pipeline / quick_test)
   - `collect_ml_server.log`, `collect_ml_proxy_label{0,1}.log`, `collect_fuse.log`, `collect_attack_round*.log` (recolección)
