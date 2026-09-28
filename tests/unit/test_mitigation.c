@@ -12,11 +12,24 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <errno.h>
+#include <string.h>
+#include <unistd.h>
 #include "mitigation.h"
 
 static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
+
+#define ASSERT(expr) do {                                                         \
+    tests_run++;                                                                  \
+    if (expr) {                                                                   \
+        tests_passed++;                                                           \
+        printf("  PASS: %s\n", __func__);                                         \
+    } else {                                                                      \
+        tests_failed++;                                                           \
+        printf("  FAIL: %s: %s\n", __func__, #expr);                              \
+    }                                                                             \
+} while (0)
 
 #define ASSERT_NOT_CRASH(expr, msg) do {                                          \
     tests_run++;                                                                  \
@@ -52,11 +65,22 @@ static void test_kill_invalid_pid(void) {
 
     /* PID just below INT32_MAX — cannot exist on any Linux system.
      * /proc/sys/kernel/pid_max defaults to 32768 or 4194304.
-     * Should return -1 (ESRCH) safely. */
-    ASSERT_NEGATIVE(mitigation_kill_process(0x7FFFFFFE));
+     * Should return MIT_NO_PROCESS (-1) safely. */
+    ASSERT_NEGATIVE(mitigation_kill_process(0x7FFFFFFE, 0));
 
-    /* Another impossible PID — should also return -1 without crashing. */
-    ASSERT_NEGATIVE(mitigation_kill_process(0x7FFFFFFD));
+    /* Another impossible PID — should also return negative without crash */
+    ASSERT_NEGATIVE(mitigation_kill_process(0x7FFFFFFD, 0));
+}
+
+static void test_pid_reuse_not_killed(void) {
+    /* Nuestro propio PID con starttime "esperado" incorrecto:
+     * la verificación de identidad debe impedir el kill — si fallara,
+     * este test moriría antes de llegar al ASSERT (SIGKILL a nosotros
+     * mismos). En sistemas sin /proc (p.ej. macOS en dev) cur==0 →
+     * MIT_NO_PROCESS: tampoco mata. */
+    int r = mitigation_kill_process((uint32_t)getpid(), 123456789ULL);
+    ASSERT(r != MIT_KILLED);
+    ASSERT(r == MIT_PID_REUSED || r == MIT_NO_PROCESS);
 }
 
 static void test_function_exists(void) {
@@ -71,6 +95,7 @@ int main(void) {
     printf("=== Mitigation Unit Tests ===\n\n");
 
     test_kill_invalid_pid();
+    test_pid_reuse_not_killed();
     test_function_exists();
 
     printf("\n=== Results: %d/%d passed, %d failed ===\n",
