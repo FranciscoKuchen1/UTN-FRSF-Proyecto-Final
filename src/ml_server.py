@@ -78,13 +78,32 @@ class RansomwareDetector:
             eval_metric="logloss",
             random_state=42,
         )
-        self.lstm  = self._build_lstm() if LSTM_AVAILABLE else None
+        # LSTM solo si existe un checkpoint entrenado. Antes se construía
+        # con pesos ALEATORIOS si torch estaba instalado → ruido con peso
+        # 0.15 en el ensemble.
+        self.lstm  = self._load_lstm(model_dir) if LSTM_AVAILABLE else None
         self.trained = False
+        self.iso_trained = False
         self.model_dir = model_dir
 
         # Historial por PID para la LSTM (últimas 10 ventanas)
         self._pid_history: dict[int, list] = {}
         self._hist_lock = threading.Lock()
+
+    def _load_lstm(self, path: Path):
+        """Carga la LSTM desde un checkpoint (lstm.pt); None si no hay."""
+        ckpt = path / "lstm.pt"
+        if not ckpt.exists():
+            return None
+        try:
+            model = self._build_lstm()
+            model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+            model.eval()
+            print(f"[ml_server] LSTM cargada desde {ckpt}")
+            return model
+        except Exception as e:
+            print(f"[ml_server] checkpoint LSTM inválido ({e}) — sin LSTM")
+            return None
 
     def _build_lstm(self):
         """LSTM para series temporales de features por PID."""
@@ -123,6 +142,7 @@ class RansomwareDetector:
         # (entrenamiento separado, ver train_model.py)
 
         self.trained = True
+        self.iso_trained = True
         self.save(self.model_dir)
 
     def predict(self, features: dict, pid: int) -> dict:
@@ -144,25 +164,32 @@ class RansomwareDetector:
 
         # Scores individuales
         p_rf    = self.rf.predict_proba(x_sc)[0][1]
-        iso_sc  = self.iso_forest.score_samples(x_sc)[0]  # más negativo = más anómalo
-        p_iso   = 1.0 / (1.0 + np.exp(iso_sc * 5))        # sigmoid sobre score
+        if self.iso_trained:
+            iso_sc = self.iso_forest.score_samples(x_sc)[0]  # más negativo = más anómalo
+            p_iso  = 1.0 / (1.0 + np.exp(iso_sc * 5))        # sigmoid sobre score
+        else:
+            p_iso = 0.5  # sin modelo de anomalía → neutral
         p_xgb   = self.xgb.predict_proba(x_sc)[0][1]
 
-        # LSTM sobre historial del PID
+        # LSTM sobre historial del PID — solo con modelo cargado
         p_lstm = 0.5
-        if LSTM_AVAILABLE and self.lstm is not None:
+        if self.lstm is not None:
             seq = self._get_sequence(pid, x)
             if seq is not None:
                 with torch.no_grad():
                     t = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
                     p_lstm = float(self.lstm(t)[0][0])
 
-        # Ensemble: voting ponderado
-        weights = {"rf": 0.35, "iso": 0.20, "xgb": 0.30, "lstm": 0.15}
-        p_attack = (weights["rf"]   * p_rf   +
-                    weights["iso"]  * p_iso  +
-                    weights["xgb"]  * p_xgb  +
-                    weights["lstm"] * p_lstm)
+        # Ensemble: voting ponderado, renormalizado con los modelos
+        # realmente disponibles — un peso muerto (modelo ausente) sesga
+        # el umbral de decisión del ensemble
+        components = {"rf": (0.35, p_rf), "xgb": (0.30, p_xgb)}
+        if self.iso_trained:
+            components["iso"] = (0.20, p_iso)
+        if self.lstm is not None:
+            components["lstm"] = (0.15, p_lstm)
+        total_w = sum(w for w, _ in components.values())
+        p_attack = sum(w * p for w, p in components.values()) / total_w
 
         # Feature importance feedback para flags
         if features.get("canary_accessed", 0):
@@ -246,7 +273,11 @@ class RansomwareDetector:
     def load(self, path: Path):
         self.scaler     = joblib.load(path / "scaler.pkl")
         self.rf         = joblib.load(path / "rf.pkl")
-        self.iso_forest = joblib.load(path / "iso_forest.pkl")
+        iso_path = path / "iso_forest.pkl"
+        if iso_path.exists():
+            self.iso_forest = joblib.load(iso_path)
+            self.iso_trained = True
+        # Artefactos viejos sin iso_forest.pkl: sigue sin él (peso redistribuido)
         self.xgb.load_model(str(path / "xgb.json"))
         self.trained = True
 

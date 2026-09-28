@@ -4,9 +4,16 @@ set -euo pipefail
 # collect_training_data.sh — Recolecta datos de entrenamiento ML etiquetados
 # Uso: ./scripts/collect_training_data.sh [rounds]
 #   rounds: iteraciones por fase (default: 10)
-#   Fase 1 (label 1): simulador de ransomware con parámetros variados
+#   Fase 1 (label 1): simulador con modo/velocidad/workers/cifrado parcial
+#                     variados (perfiles calibrados de familias reales)
 #   Fase 2 (label 0): workloads benignos (copias, tar, appends, binarios)
-# Todo dentro de /tmp/guardian_collect_* — no toca datos reales.
+#   Proxy por ronda con --tag atk_rN/ben_rN → columna session del CSV:
+#   train_model.py evalúa agrupado por sesión (StratifiedGroupKFold, sin
+#   leakage de ventanas contiguas entre train y test).
+#   Corre en shadow mode por defecto (GUARDIAN_SHADOW_MODE=1): sin kill →
+#   cada ataque aporta features de TODAS sus ventanas. Override:
+#   GUARDIAN_SHADOW_MODE=0 ./scripts/collect_training_data.sh [rounds]
+#   Todo dentro de /tmp/guardian_collect_* — no toca datos reales.
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -97,27 +104,29 @@ start_server() {
 
 start_proxy() {
     local label=$1
-    log_info "Starting ML proxy (label: $label)..."
+    local tag=${2:-s0}
+    log_info "Starting ML proxy (label: $label, session: $tag)..."
     rm -f /tmp/guardian_ml_proxy.sock
     "$PYTHON" "$SCRIPT_DIR/ml_proxy.py" \
         --label "$label" \
+        --tag "$tag" \
         --backend-socket /tmp/guardian_ml.sock \
         --output "$OUTPUT_CSV" \
-        > "$LOG_DIR/collect_ml_proxy_label$label.log" 2>&1 &
+        > "$LOG_DIR/collect_ml_proxy_${tag}.log" 2>&1 &
     ML_PROXY_PID=$!
     for _ in {1..10}; do
         if ! kill -0 "$ML_PROXY_PID" 2>/dev/null; then
-            log_error "ML proxy died. Check: $LOG_DIR/collect_ml_proxy_label$label.log"
-            cat "$LOG_DIR/collect_ml_proxy_label$label.log"
+            log_error "ML proxy died. Check: $LOG_DIR/collect_ml_proxy_${tag}.log"
+            cat "$LOG_DIR/collect_ml_proxy_${tag}.log"
             exit 1
         fi
         if [[ -S /tmp/guardian_ml_proxy.sock ]]; then
-            log_success "ML proxy started (PID: $ML_PROXY_PID)"
+            log_success "ML proxy started (PID: $ML_PROXY_PID, session: $tag)"
             return 0
         fi
         sleep 0.5
     done
-    log_error "ML proxy failed to create socket. Check: $LOG_DIR/collect_ml_proxy_label$label.log"
+    log_error "ML proxy failed to create socket. Check: $LOG_DIR/collect_ml_proxy_${tag}.log"
     exit 1
 }
 
@@ -134,6 +143,15 @@ start_fuse() {
     log_info "Starting FUSE filesystem..."
     export GUARDIAN_REAL_ROOT="$REAL_ROOT"
     export GUARDIAN_ZFS_DATASET="tank/data"
+    # Shadow mode por defecto: registra veredictos SIN bloquear/kill →
+    # los ataques generan features de todas sus ventanas (no mueren en
+    # la 1ra). Override: GUARDIAN_SHADOW_MODE=0
+    export GUARDIAN_SHADOW_MODE="${GUARDIAN_SHADOW_MODE:-1}"
+    if [[ "$GUARDIAN_SHADOW_MODE" == "1" ]]; then
+        log_info "Shadow mode ON (log-only, sin bloqueos)"
+    else
+        log_info "Shadow mode OFF (enforce: bloqueo + kill)"
+    fi
 
     local FUSE_OPTS="default_permissions"
     if grep -qE '^[[:space:]]*user_allow_other' /etc/fuse.conf 2>/dev/null; then
@@ -164,14 +182,29 @@ attack_round() {
     local count=$((30 + (r * 13) % 50))
     local pause=$(((r % 3) * 20))
 
+    # Variedad realista: workers paralelos (PIDs propios → dilución del
+    # scoring per-PID), cifrado parcial/intermitente y perfil realista
+    local workers=$((1 + (r % 4)))              # 1..4 workers
+    local partials=(100 100 75 100 50)         # % del archivo cifrado
+    local partial="${partials[$((r % 5))]}"
+
     local args=(--target-dir "$MOUNTPOINT" --mode "$mode"
                 --file-count "$count" --pause-ms "$pause"
-                --no-cleanup --avoid-canary)
+                --no-cleanup --avoid-canary
+                --workers "$workers" --partial-encrypt "$partial")
     if ((r % 4 == 3)); then
         args+=(--no-rename --canary-hunt)
     fi
+    if ((r % 2 == 1)); then
+        args+=(--realistic)
+    fi
 
-    log_info "  Attack round $r/$ROUNDS (mode=$mode, files=$count, pause=${pause}ms)"
+    # Proxy por ronda con tag de sesión: las filas de esta ronda quedan
+    # agrupadas (StratifiedGroupKFold sin leakage en train_model.py)
+    stop_proxy
+    start_proxy 1 "atk_r${r}"
+
+    log_info "  Attack round $r/$ROUNDS (mode=$mode, files=$count, pause=${pause}ms, workers=$workers, partial=${partial}%)"
     "$PYTHON" "$SCRIPT_DIR/simulate_ransomware.py" "${args[@]}" \
         > "$LOG_DIR/collect_attack_round$r.log" 2>&1 || true
     sleep 6
@@ -181,6 +214,8 @@ benign_round() {
     local r=$1
     local wd="$MOUNTPOINT/work_$r"
     log_info "  Benign round $r/$ROUNDS"
+    stop_proxy
+    start_proxy 0 "ben_r${r}"
     mkdir -p "$wd"
 
     cp -r "$PROJECT_ROOT/src" "$wd/src" 2>/dev/null || true
@@ -219,11 +254,10 @@ main() {
     log_info "Rounds per phase: $ROUNDS"
 
     start_server
-    start_proxy 1
     start_fuse
 
     echo
-    log_info "Phase 1/2 — Attack runs (label 1)..."
+    log_info "Phase 1/2 — Attack runs (label 1, proxy por ronda con tag)..."
     local r
     for r in $(seq 1 "$ROUNDS"); do
         attack_round "$r"
@@ -233,12 +267,7 @@ main() {
     log_success "Attack phase done — CSV rows: $rows_attack (+$((rows_attack - rows_before)))"
 
     echo
-    log_info "Switching proxy to label 0 (analyzer reconnects within ~5s)..."
-    stop_proxy
-    start_proxy 0
-    sleep 6
-
-    log_info "Phase 2/2 — Benign workloads (label 0)..."
+    log_info "Phase 2/2 — Benign workloads (label 0, proxy por ronda con tag)..."
     for r in $(seq 1 "$ROUNDS"); do
         benign_round "$r"
     done

@@ -50,32 +50,37 @@ FEATURE_NAMES = [
 
 class FeatureCSVLogger:
     """Logger thread-safe que escribe features en CSV."""
-    
-    def __init__(self, output_path: str, label: int):
+
+    def __init__(self, output_path: str, label: int, session: str = "s0"):
         self.output_path = Path(output_path)
         self.label = label
+        self.session = session
         self.lock = threading.Lock()
         self.count = 0
-        
+
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # Escribir header si es nuevo
         if not self.output_path.exists() or self.output_path.stat().st_size == 0:
             self._write_header()
-    
+
     def _write_header(self):
         with open(self.output_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(FEATURE_NAMES + ['label', 'timestamp', 'pid'])
-    
+            # session = ronda de recolección: permite evaluar agrupado por
+            # sesión (StratifiedGroupKFold) sin leakage entre train/test
+            writer.writerow(FEATURE_NAMES + ['label', 'session',
+                                             'timestamp', 'pid'])
+
     def log_request(self, request: dict):
         """Loggea un request de features."""
         features = request.get("features", {})
         pid = request.get("pid", 0)
         timestamp = datetime.now().isoformat()
-        
+
         row = [features.get(name, 0.0) for name in FEATURE_NAMES]
         row.append(self.label)
+        row.append(self.session)
         row.append(timestamp)
         row.append(pid)
         
@@ -95,11 +100,11 @@ class MLProxy:
     Loggea todas las features que pasan.
     """
     
-    def __init__(self, proxy_socket: str, backend_socket: str, 
-                 output_path: str, label: int):
+    def __init__(self, proxy_socket: str, backend_socket: str,
+                 output_path: str, label: int, session: str = "s0"):
         self.proxy_socket_path = proxy_socket
         self.backend_socket_path = backend_socket
-        self.logger = FeatureCSVLogger(output_path, label)
+        self.logger = FeatureCSVLogger(output_path, label, session)
         self.running = False
     
     def start(self):
@@ -125,7 +130,8 @@ class MLProxy:
             print(f"[proxy] Backend: {self.backend_socket_path}")
             print(f"[proxy] Loggeando en: {self.logger.output_path}")
             print(f"[proxy] Etiqueta: {self.logger.label} "
-                  f"({'ransomware' if self.logger.label else 'benigno'})")
+                  f"({'ransomware' if self.logger.label else 'benigno'})"
+                  f" | Sesión: {self.logger.session}")
             print("[proxy] Presiona Ctrl+C para detener\n")
             
             try:
@@ -197,6 +203,11 @@ def main():
         help="Etiqueta: 0=benigno, 1=ransomware"
     )
     parser.add_argument(
+        "--tag", default="s0",
+        help="ID de sesión/ronda (columna session del CSV) — permite "
+             "evaluar agrupado por sesión sin leakage (default: s0)"
+    )
+    parser.add_argument(
         "--output", default="data/training_data.csv",
         help="CSV de salida (default: data/training_data.csv)"
     )
@@ -215,7 +226,8 @@ def main():
         proxy_socket=args.proxy_socket,
         backend_socket=args.backend_socket,
         output_path=args.output,
-        label=args.label
+        label=args.label,
+        session=args.tag
     )
     proxy.start()
 
