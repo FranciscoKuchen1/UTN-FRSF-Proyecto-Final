@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <pthread.h>
@@ -76,6 +77,19 @@ static char *get_env_or(const char *name, const char *fallback) {
     return strdup(val ? val : fallback);
 }
 
+/* ── Modo shadow: registrar veredictos SIN bloquear/kill/snapshot ──
+ * Para recolección de datos (los ataques generan features de todas sus
+ * ventanas, no mueren en la primera) y medición de FPs sin riesgo.
+ * Activación: GUARDIAN_SHADOW_MODE=1 (o true/yes/on). */
+static int g_shadow;
+
+static int getenv_bool(const char *name) {
+    const char *v = getenv(name);
+    if (!v) return 0;
+    return strcasecmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
+           strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0;
+}
+
 /* ── Configuración global ── */
 #define WINDOW_SECS       5       /* ventana de análisis en segundos */
 #define ENTROPY_THRESHOLD 7.2     /* bits/byte — umbral de alerta */
@@ -97,6 +111,30 @@ static guardian_state_t gstate;
 /* Globals for cross-module access (analyzer, mitigation) */
 struct ring_buf    *evbuf;
 struct detector_ctx *detector;
+
+/* Rate-limit del log de writes sospechosos (acceso atómico relajado —
+ * best-effort entre hilos FUSE) */
+static uint64_t last_susp_log_ns;
+
+/* Mitigación con verificación de identidad: mata solo si el starttime
+ * actual del PID coincide con el registrado por el detector (evita
+ * matar a un inocente que reutilizó el PID de un atacante muerto).
+ * El resultado va al log estructurado. */
+static void mitigate_and_log(uint32_t pid, const char *path) {
+    int kr = mitigation_kill_process(pid,
+                                     detector_pid_starttime(gstate.det, pid));
+    if (kr == MIT_PID_REUSED)
+        detector_reset_pid(gstate.det, pid);   /* estado envenenado */
+
+    const char *res = kr == MIT_KILLED ? "killed"
+                    : kr == MIT_PID_REUSED ? "pid_reused"
+                    : kr == MIT_NO_PROCESS ? "already_gone"
+                    : "error";
+    char extra[96];
+    snprintf(extra, sizeof(extra), "\"result\":\"%s\"", res);
+    log_event(kr == MIT_KILLED ? "process_killed" : "kill_skipped",
+              pid, path, extra);
+}
 
 /* Construye la ruta real en ZFS */
 static void real_path(char *dst, const char *path) {
@@ -120,16 +158,27 @@ static int gfs_open(const char *path, struct fuse_file_info *fi) {
     if (fd < 0) return -errno;
     fi->fh = fd;
 
-    /* Detectar apertura de canary */
+    /* Detectar apertura de canary — discriminar por intención:
+     * un ransomware abre los canaries para ESCRIBIR (cifrarlos); un backup
+     * (tar/cp -r/rsync), thumbnailer o AV los abre SOLO para leer.
+     * Lectura read-only: señal leve (no arma el kill) — sin esto, un
+     * cp -r dentro del mount que toca un canary muere en su próxima
+     * escritura. */
     if (canary_is_canary(gstate.can, path)) {
         uint32_t pid = fuse_get_context()->pid;
+        int write_intent = (fi->flags & O_ACCMODE) != O_RDONLY;
         io_event_t cev = { .type = EV_CANARY, .pid = pid,
                            .ts_ns = clock_gettime_ns() };
         strncpy(cev.path, path, sizeof(cev.path) - 1);
         ring_buf_push(gstate.evbuf, &cev);
-        log_event("canary_accessed", pid, path,
-                  "\"verdict\":\"SUSPICIOUS\"");
-        detector_signal_canary(gstate.det, path, pid);
+        if (write_intent) {
+            log_event("canary_open_write", pid, path,
+                      "\"verdict\":\"SUSPICIOUS\"");
+            detector_signal_canary(gstate.det, path, pid);
+        } else {
+            log_event("canary_read", pid, path, "\"verdict\":\"NOTE\"");
+            detector_note_canary_read(gstate.det, pid);
+        }
     }
     return 0;
 }
@@ -175,17 +224,40 @@ static int gfs_write(const char *path, const char *buf, size_t size,
     ring_buf_push(gstate.evbuf, &ev);
 
     /* 3. Evaluación sincrónica rápida (umbrales locales por proceso) */
-    int verdict = detector_check_write(gstate.det, pid, path, ent, size);
+    int verdict = detector_check_write(gstate.det, pid, path, ent, size,
+                                       chi2);
     if (verdict == VERDICT_BLOCK) {
-        char extra[128];
+        char extra[160];
         snprintf(extra, sizeof(extra),
-                 "\"entropy\":%.4f,\"size\":%zu,\"verdict\":\"BLOCK\"",
-                 ent, size);
+                 "\"entropy\":%.4f,\"size\":%zu,\"verdict\":\"BLOCK\","
+                 "\"mode\":\"%s\",\"brake\":%d",
+                 ent, size, g_shadow ? "shadow" : "enforce",
+                 detector_global_brake_armed(gstate.det));
         log_event("write_blocked", pid, path, extra);
-        /* Bloquear escritura y disparar snapshot de emergencia */
-        zfs_snapshot_emergency(gstate.zfs_dataset);
-        mitigation_kill_process(pid);
-        return -EPERM;   /* permiso denegado → ransomware ve error */
+        if (!g_shadow) {
+            /* Bloquear escritura y disparar snapshot de emergencia */
+            zfs_snapshot_emergency(gstate.zfs_dataset);
+            mitigate_and_log(pid, path);
+            return -EPERM;   /* permiso denegado → ransomware ve error */
+        }
+        /* shadow: registrar y dejar pasar */
+    } else if (verdict == VERDICT_SUSPICIOUS) {
+        /* Snapshot temprano (pre-daño): en el primer WARN el estado está
+         * casi limpio — un snapshot acá preserva los datos previos al
+         * ataque. El cooldown interno lo dedup; el costo es CoW. */
+        if (!g_shadow)
+            zfs_snapshot_emergency(gstate.zfs_dataset);
+        uint64_t now = clock_gettime_ns();
+        uint64_t last = __atomic_load_n(&last_susp_log_ns, __ATOMIC_RELAXED);
+        if (now - last > 1000000000ULL) {   /* ≥1s entre logs */
+            __atomic_store_n(&last_susp_log_ns, now, __ATOMIC_RELAXED);
+            char extra[160];
+            snprintf(extra, sizeof(extra),
+                     "\"entropy\":%.4f,\"size\":%zu,"
+                     "\"verdict\":\"SUSPICIOUS\"",
+                     ent, size);
+            log_event("write_suspicious", pid, path, extra);
+        }
     }
 
     /* 4. Escritura real en ZFS */
@@ -214,17 +286,51 @@ static int gfs_rename(const char *from, const char *to, unsigned int flags) {
     strncpy(ev.path, from, sizeof(ev.path) - 1);
     ring_buf_push(gstate.evbuf, &ev);
 
-    if (detector_check_rename(gstate.det, pid, from, to, ext_changed)
-            == VERDICT_BLOCK) {
-        char extra[128];
+    /* Renombrar un canary: cambio de extensión (.docx → .locked) es
+     * comportamiento de ransomware → señal fuerte. Un usuario moviendo
+     * el archivo sin cambiar extensión → solo señal leve (misma regla
+     * anti-FP que gfs_open). */
+    if (canary_is_canary(gstate.can, from)) {
+        io_event_t cev = { .type = EV_CANARY, .pid = pid,
+                           .ts_ns = clock_gettime_ns() };
+        strncpy(cev.path, from, sizeof(cev.path) - 1);
+        ring_buf_push(gstate.evbuf, &cev);
+        if (ext_changed) {
+            log_event("canary_renamed", pid, from,
+                      "\"verdict\":\"SUSPICIOUS\"");
+            detector_signal_canary(gstate.det, from, pid);
+        } else {
+            log_event("canary_read", pid, from, "\"verdict\":\"NOTE\"");
+            detector_note_canary_read(gstate.det, pid);
+        }
+    }
+
+    int verdict = detector_check_rename(gstate.det, pid, from, to,
+                                        ext_changed);
+    if (verdict == VERDICT_BLOCK) {
+        char extra[192];
         snprintf(extra, sizeof(extra),
                  "\"from\":\"%s\",\"to\":\"%s\",\"ext_changed\":%d,"
-                 "\"verdict\":\"BLOCK\"",
-                 from, to, ext_changed);
+                 "\"verdict\":\"BLOCK\",\"mode\":\"%s\",\"brake\":%d",
+                 from, to, ext_changed, g_shadow ? "shadow" : "enforce",
+                 detector_global_brake_armed(gstate.det));
         log_event("rename_blocked", pid, from, extra);
-        zfs_snapshot_emergency(gstate.zfs_dataset);
-        mitigation_kill_process(pid);
-        return -EPERM;
+        if (!g_shadow) {
+            zfs_snapshot_emergency(gstate.zfs_dataset);
+            mitigate_and_log(pid, from);
+            return -EPERM;
+        }
+        /* shadow: registrar y dejar pasar */
+    } else if (verdict == VERDICT_SUSPICIOUS) {
+        /* Snapshot temprano pre-daño (dedup por cooldown interno) */
+        if (!g_shadow)
+            zfs_snapshot_emergency(gstate.zfs_dataset);
+        char extra[192];
+        snprintf(extra, sizeof(extra),
+                 "\"from\":\"%s\",\"to\":\"%s\",\"ext_changed\":%d,"
+                 "\"verdict\":\"SUSPICIOUS\"",
+                 from, to, ext_changed);
+        log_event("rename_suspicious", pid, from, extra);
     }
 
     return renameat2(AT_FDCWD, rf, AT_FDCWD, rt, flags) < 0 ? -errno : 0;
@@ -241,16 +347,37 @@ static int gfs_unlink(const char *path) {
         ring_buf_push(gstate.evbuf, &cev);
         log_event("canary_deleted", pid, path,
                   "\"verdict\":\"ATTACK_CONFIRMED\"");
-        zfs_snapshot_emergency(gstate.zfs_dataset);
         detector_confirm_attack(gstate.det, pid);
-        mitigation_kill_process(pid);
-        return -EPERM;
+        if (!g_shadow) {
+            zfs_snapshot_emergency(gstate.zfs_dataset);
+            mitigate_and_log(pid, path);
+            return -EPERM;
+        }
+        /* shadow: el estado del detector ya quedó marcado; dejar pasar */
     }
 
     io_event_t ev = { .type = EV_UNLINK, .pid = pid,
                       .ts_ns = clock_gettime_ns() };
     strncpy(ev.path, path, sizeof(ev.path) - 1);
     ring_buf_push(gstate.evbuf, &ev);
+
+    /* Caza de backups / borrado de originales tras cifrar: el unlink
+     * alimenta el score (solo no bloquea — make clean debe pasar) */
+    int verdict = detector_check_unlink(gstate.det, pid, path);
+    if (verdict == VERDICT_BLOCK) {
+        char extra[192];
+        snprintf(extra, sizeof(extra),
+                 "\"verdict\":\"BLOCK\",\"mode\":\"%s\",\"brake\":%d",
+                 g_shadow ? "shadow" : "enforce",
+                 detector_global_brake_armed(gstate.det));
+        log_event("unlink_blocked", pid, path, extra);
+        if (!g_shadow) {
+            zfs_snapshot_emergency(gstate.zfs_dataset);
+            mitigate_and_log(pid, path);
+            return -EPERM;
+        }
+        /* shadow: registrar y dejar pasar */
+    }
 
     char rp[PATH_MAX];
     real_path(rp, path);
@@ -333,6 +460,7 @@ static const struct fuse_operations guardian_ops = {
 int main(int argc, char *argv[]) {
     /* Inicialización */
     log_init();
+    g_shadow         = getenv_bool("GUARDIAN_SHADOW_MODE");
     gstate.real_root   = get_env_or("GUARDIAN_REAL_ROOT", "/zpool/data");
     gstate.zfs_dataset = get_env_or("GUARDIAN_ZFS_DATASET", "tank/data");
     /* NOTE: real_root and zfs_dataset are never freed — this is a
@@ -353,6 +481,22 @@ int main(int argc, char *argv[]) {
 
     canary_deploy(gstate.can, 20);    /* sembrar 20 archivos canary */
     zfs_snapshot_schedule(gstate.zfs_dataset, 60); /* snap cada 60s */
+
+    /* Config visible en el log (provenance del dataset) + modo */
+    {
+        char extra[192];
+        snprintf(extra, sizeof(extra),
+                 "\"mode\":\"%s\",\"window_secs\":%d,"
+                 "\"entropy_threshold\":%.1f,\"write_thresh\":%d,"
+                 "\"rename_thresh\":%d",
+                 g_shadow ? "shadow" : "enforce",
+                 WINDOW_SECS, ENTROPY_THRESHOLD,
+                 WRITE_RATE_THRESH, RENAME_THRESH);
+        log_event("daemon_start", 0, gstate.real_root, extra);
+    }
+    if (g_shadow)
+        fprintf(stderr, "[guardian] SHADOW MODE: se registran veredictos "
+                        "sin bloquear (sin snapshot/kill/EPERM)\n");
 
     return fuse_main(argc, argv, &guardian_ops, &gstate);
 }

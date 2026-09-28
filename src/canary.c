@@ -6,7 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/inotify.h>
+#include <sys/stat.h>
 #include "canary.h"
 
 /*
@@ -30,6 +30,9 @@ static const char *CANARY_NAMES[] = {
 };
 #define N_CANARY_NAMES 7
 
+static const char *CANARY_DIRS[] = { "", "docs", "finanzas", "backup" };
+#define N_CANARY_DIRS 4
+
 struct canary_ctx {
     char   **paths;        /* rutas absolutas de canaries desplegados */
     size_t   n_paths;
@@ -52,10 +55,37 @@ void canary_deploy(struct canary_ctx *ctx, int count) {
         "Confidential - Internal Use Only\n";
     size_t fake_len = strlen(fake_content);
 
-    for (int i = 0; i < count && i < N_CANARY_NAMES; i++) {
+    if (count <= 0) return;
+
+    for (int i = 0; i < count; i++) {
+        const char *tpl = CANARY_NAMES[i % N_CANARY_NAMES];
+        const char *dir = CANARY_DIRS[i % N_CANARY_DIRS];
+        char name[512];
+
+        if (i < N_CANARY_NAMES) {
+            snprintf(name, sizeof(name), "%s", tpl);
+        } else {
+            /* Sufijo incremental antes de la extensión para nombres únicos
+             * cuando count > N_CANARY_NAMES */
+            const char *dot = strrchr(tpl, '.');
+            if (dot && dot != tpl) {
+                snprintf(name, sizeof(name), "%.*s_%d%s",
+                         (int)(dot - tpl), tpl,
+                         i / N_CANARY_NAMES + 1, dot);
+            } else {
+                snprintf(name, sizeof(name), "%s_%d", tpl,
+                         i / N_CANARY_NAMES + 1);
+            }
+        }
+
         char path[4096];
-        snprintf(path, sizeof(path), "%s/%s",
-                 ctx->root, CANARY_NAMES[i % N_CANARY_NAMES]);
+        if (*dir) {
+            snprintf(path, sizeof(path), "%s/%s", ctx->root, dir);
+            mkdir(path, 0755);   /* EEXIST esperado en re-deploy */
+            snprintf(path, sizeof(path), "%s/%s/%s", ctx->root, dir, name);
+        } else {
+            snprintf(path, sizeof(path), "%s/%s", ctx->root, name);
+        }
 
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) continue;

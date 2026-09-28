@@ -30,17 +30,23 @@ static int tests_failed = 0;
     }                                                                             \
 } while(0)
 
-/* Helper: count files in a directory (non-recursive, skips '.' and '..') */
-static int count_files_in(const char *dirpath) {
+/* Helper: count regular files recursively (canaries live in subdirs too) */
+static int count_files_recursive(const char *dirpath) {
     DIR *d = opendir(dirpath);
     if (!d) return -1;
     int count = 0;
     struct dirent *entry;
     while ((entry = readdir(d)) != NULL) {
-        /* Skip only the directory entries, not hidden files */
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
-        count++;
+        char sub[4096];
+        snprintf(sub, sizeof(sub), "%s/%s", dirpath, entry->d_name);
+        struct stat st;
+        if (stat(sub, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode))
+            count += count_files_recursive(sub);
+        else
+            count++;
     }
     closedir(d);
     return count;
@@ -75,17 +81,20 @@ static void test_canary_is_canary_true(void) {
     struct canary_ctx *ctx = canary_init(tmpdir);
     ASSERT(ctx != NULL);
 
-    canary_deploy(ctx, 3);
+    /* Layout determinista de canary_deploy (names y dirs rotan por índice):
+     *   i=0 → raíz,      i=1 → docs/,     i=2 → finanzas/,  i=3 → backup/
+     *   i>=7 → nombres con sufijo _N en el dir correspondiente.
+     * is_canary matchea fuse_path contra la ruta relativa al root. */
+    canary_deploy(ctx, 10);
 
-    /* After deploy, we should be able to check if a deployed file is a canary.
-     * The is_canary function matches fuse_path against the relative path from root.
-     * In canary_deploy, paths are stored as abs: tmpdir/CANARY_NAME.
-     * is_canary checks: stored_path + strlen(root) == fuse_path */
     int found = canary_is_canary(ctx, "/A_important_report.docx");
     ASSERT(found == 1);
 
-    int found2 = canary_is_canary(ctx, "/ZZ_backup_keys.txt");
+    int found2 = canary_is_canary(ctx, "/finanzas/ZZ_backup_keys.txt");
     ASSERT(found2 == 1);
+
+    int found3 = canary_is_canary(ctx, "/backup/A_important_report_2.docx");
+    ASSERT(found3 == 1);
 
     rm_rf(tmpdir);
     free(ctx);
@@ -120,11 +129,12 @@ static void test_deploy_count(void) {
     struct canary_ctx *ctx = canary_init(tmpdir);
     ASSERT(ctx != NULL);
 
-    canary_deploy(ctx, 5);
+    /* deploy(N) debe crear exactamente N archivos (distribuidos entre
+     * raíz y subdirectorios), sin el cap silencioso anterior en 7 */
+    canary_deploy(ctx, 9);
 
-    /* Verify N files exist on disk */
-    int count = count_files_in(tmpdir);
-    ASSERT(count == 5);
+    int count = count_files_recursive(tmpdir);
+    ASSERT(count == 9);
 
     rm_rf(tmpdir);
     free(ctx);

@@ -240,7 +240,10 @@ static void reset_window(pid_stats_t *s, time_t now) {
 
 /* Rota ventanas expiradas por tiempo (no por eventos): envía features al
  * proxy ML antes de resetear. Así también se registran las features de
- * procesos ya matados por la mitigación. */
+ * procesos ya matados por la mitigación.
+ * PIDs cuya ventana venció sin actividad suficiente liberan su slot: sin
+ * esto la tabla se llena con procesos muertos y las features ML se pierden
+ * en silencio para siempre (incluido un atacante nuevo). */
 static void flush_expired_windows(int *ml_fd) {
     time_t now = time(NULL);
 
@@ -263,7 +266,10 @@ static void flush_expired_windows(int *ml_fd) {
                 detector_confirm_attack(detector, s->pid);
             }
         }
-        reset_window(s, now);
+        if (s->write_count < 10)
+            memset(s, 0, sizeof(*s));       /* active = 0 → slot libre */
+        else
+            reset_window(s, now);
     }
     pthread_mutex_unlock(&pid_mutex);
 }
@@ -315,6 +321,11 @@ void *analyzer_thread(void *arg) {
         pid_stats_t *s = get_slot(ev.pid);
         if (!s) {
             pthread_mutex_unlock(&pid_mutex);
+            static uint64_t dropped = 0;
+            if (++dropped == 1 || dropped % 1000 == 0)
+                fprintf(stderr, "[analyzer] pid_table llena — "
+                                "%llu eventos sin features (total)\n",
+                        (unsigned long long)dropped);
             continue;
         }
 
