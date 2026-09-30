@@ -98,7 +98,9 @@ mkdir -p /mnt/protected/docs_copy
 cp -r /mnt/protected/docs /mnt/protected/docs_copy        # debe COMPLETAR
 
 # grep con salida dentro del mount
-grep -r "Confidential" /mnt/protected > /mnt/protected/grep_out.txt   # debe COMPLETAR
+grep -r --exclude=grep_out.txt "Confidential" /mnt/protected \
+    > /mnt/protected/grep_out.txt        # debe COMPLETAR
+# (--exclude: sin él, grep se niega a grepear su propio archivo de salida)
 ```
 
 El kill ahora verifica identidad: en `events.jsonl` los eventos
