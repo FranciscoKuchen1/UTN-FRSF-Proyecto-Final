@@ -35,6 +35,19 @@ static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void log_init(void) {
     const char *path = getenv("GUARDIAN_LOG_PATH");
     if (!path) path = LOG_PATH_DEFAULT;
+
+    /* Crear el directorio padre si falta — fopen("a") no lo crea: con el
+     * path default, /var/log/guardian/ no existía y TODOS los eventos
+     * caían al fallback stderr (con el daemon en foreground, a la
+     * terminal — invisibles para el checklist de verificación). */
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash && slash != dir) {
+        *slash = '\0';
+        mkdir(dir, 0755);   /* EEXIST esperado; sin permisos → fallback */
+    }
+
     log_fp = fopen(path, "a");
     if (!log_fp) {
         /* fallback: stderr si no se puede abrir el archivo */

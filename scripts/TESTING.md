@@ -108,6 +108,10 @@ El kill ahora verifica identidad: en `events.jsonl` los eventos
 `"pid_reused"`, `"already_gone"`). Un ataque debe terminar en `process_killed`;
 un PID reutilizado por un proceso inocente **nunca** recibe SIGKILL.
 
+**Nota sobre `events.jsonl`**: el daemon crea `/var/log/guardian/` al iniciar
+(sudo). Si corre sin permisos (p.ej. montado por un usuario sin sudo), los
+eventos van a stderr — en los scripts quedan capturados en `logs/fuse.log`.
+
 ## Verificación del freno global (VM)
 
 Un ataque multiproceso diluye el scoring per-PID; el freno global lo atrapa
