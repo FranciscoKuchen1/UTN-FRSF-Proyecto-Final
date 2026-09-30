@@ -49,10 +49,10 @@ if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
     sleep 1
 fi
 
-# Ensure log directory exists
-LOG_DIR="${GUARDIAN_LOG_PATH%/*}"
-if [[ -n "${GUARDIAN_LOG_PATH:-}" && ! -d "$LOG_DIR" ]]; then
-    mkdir -p "$LOG_DIR"
+# Ensure log directory exists (solo si GUARDIAN_LOG_PATH está definida —
+# el daemon falla a /var/log/guardian/events.jsonl, creado por root)
+if [[ -n "${GUARDIAN_LOG_PATH:-}" && ! -d "${GUARDIAN_LOG_PATH%/*}" ]]; then
+    mkdir -p "${GUARDIAN_LOG_PATH%/*}"
 fi
 
 echo "==> Mounting guardian_fs: $SOURCE -> $MOUNTPOINT"
