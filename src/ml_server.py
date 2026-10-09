@@ -9,14 +9,16 @@ import json
 import socket
 import os
 import numpy as np
-import joblib
 import threading
 from pathlib import Path
 
 # ── Importar modelos ──────────────────────────────────────────────
-from sklearn.ensemble import RandomForestClassifier, IsolationForest
-from sklearn.preprocessing import StandardScaler
-import xgboost as xgb
+# sklearn/xgboost/joblib se importan lazy (_ensure_models/save/load):
+# un server sin modelos entrenados (modo reglas estadísticas) no paga
+# ~100 MB de RSS solo por importar. En una VM chica ese RSS extra
+# hacía del server el favorito del OOM killer (moría mid-run y el
+# analyzer flapeaba "ML connection lost / Reconnected" en loop).
+#
 # Para LSTM (opcional, requiere PyTorch)
 try:
     import torch
@@ -58,6 +60,37 @@ class FeatureVector:
 
 class RansomwareDetector:
     def __init__(self, model_dir: Path):
+        # Modelos pesados: None hasta train()/load() — el modo reglas
+        # estadísticas no los necesita (ver _ensure_models).
+        self.scaler = None
+        self.rf     = None
+        self.iso_forest = None
+        self.xgb    = None
+        # LSTM solo si existe un checkpoint entrenado. Antes se construía
+        # con pesos ALEATORIOS si torch estaba instalado → ruido con peso
+        # 0.15 en el ensemble.
+        self.lstm  = self._load_lstm(model_dir) if LSTM_AVAILABLE else None
+        self.trained = False
+        self.iso_trained = False
+        self.model_dir = model_dir
+
+        # Historial por PID para la LSTM (últimas 10 ventanas)
+        self._pid_history: dict[int, list] = {}
+        self._hist_lock = threading.Lock()
+
+    def _ensure_models(self):
+        """Construye (e importa) los estimadores solo cuando se usan.
+
+        Sin modelos entrenados el server sirve reglas estadísticas con
+        ~30 MB de RSS; importar sklearn+xgboost al arrancar sumaba
+        ~100 MB (en VM chica: OOM mid-run → flapping del analyzer).
+        """
+        if self.rf is not None:
+            return
+        from sklearn.ensemble import RandomForestClassifier, IsolationForest
+        from sklearn.preprocessing import StandardScaler
+        import xgboost as xgb
+
         self.scaler = StandardScaler()
         self.rf     = RandomForestClassifier(
             n_estimators=200,
@@ -78,17 +111,6 @@ class RansomwareDetector:
             eval_metric="logloss",
             random_state=42,
         )
-        # LSTM solo si existe un checkpoint entrenado. Antes se construía
-        # con pesos ALEATORIOS si torch estaba instalado → ruido con peso
-        # 0.15 en el ensemble.
-        self.lstm  = self._load_lstm(model_dir) if LSTM_AVAILABLE else None
-        self.trained = False
-        self.iso_trained = False
-        self.model_dir = model_dir
-
-        # Historial por PID para la LSTM (últimas 10 ventanas)
-        self._pid_history: dict[int, list] = {}
-        self._hist_lock = threading.Lock()
 
     def _load_lstm(self, path: Path):
         """Carga la LSTM desde un checkpoint (lstm.pt); None si no hay."""
@@ -125,6 +147,7 @@ class RansomwareDetector:
         X: (n_samples, N_FEATURES)
         y: (n_samples,) — 0=benigno, 1=ransomware
         """
+        self._ensure_models()
         X_scaled = self.scaler.fit_transform(X)
 
         # Random Forest (supervisado)
@@ -160,6 +183,7 @@ class RansomwareDetector:
             # Fallback a reglas estadísticas puras
             return self._rule_based(features, x, flags)
 
+        self._ensure_models()   # trained=True implica train()/load() previo
         x_sc = self.scaler.transform(x.reshape(1, -1))
 
         # Scores individuales
@@ -264,6 +288,8 @@ class RansomwareDetector:
         }
 
     def save(self, path: Path):
+        self._ensure_models()
+        import joblib
         path.mkdir(parents=True, exist_ok=True)
         joblib.dump(self.scaler, path / "scaler.pkl")
         joblib.dump(self.rf,     path / "rf.pkl")
@@ -271,6 +297,8 @@ class RansomwareDetector:
         self.xgb.save_model(str(path / "xgb.json"))
 
     def load(self, path: Path):
+        self._ensure_models()
+        import joblib
         self.scaler     = joblib.load(path / "scaler.pkl")
         self.rf         = joblib.load(path / "rf.pkl")
         iso_path = path / "iso_forest.pkl"

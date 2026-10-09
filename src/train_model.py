@@ -102,6 +102,9 @@ def make_pipeline(estimator) -> Pipeline:
 
 def evaluate(detector: RansomwareDetector, X, y, groups):
     """CV agrupada por sesión + holdout agrupado, por modelo."""
+    # Los estimadores se construyen lazy en ml_server (server sin modelos
+    # no paga el import de sklearn/xgboost): materializarlos antes de clone().
+    detector._ensure_models()
     n_groups = len(np.unique(groups))
     grouped = n_groups >= 2
     if not grouped:
