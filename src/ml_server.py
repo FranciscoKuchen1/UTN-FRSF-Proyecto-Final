@@ -335,9 +335,19 @@ class MLServer:
                             req.get("features", {}),
                             req.get("pid", 0)
                         )
-                        conn.sendall(json.dumps(resp).encode() + b"\n")
+                        # Compacto (sin espacios): analyzer.c parsea con
+                        # strstr("\"verdict\":\"attack\"") — con los
+                        # separadores default de json.dumps ("verdict":
+                        # "attack") el veredicto NUNCA matcheaba y toda
+                        # ventana se leía como NORMAL.
+                        conn.sendall(
+                            json.dumps(resp, separators=(",", ":"))
+                            .encode() + b"\n")
                     except Exception as e:
-                        conn.sendall(json.dumps({"error": str(e)}).encode() + b"\n")
+                        conn.sendall(
+                            json.dumps({"error": str(e)},
+                                       separators=(",", ":"))
+                            .encode() + b"\n")
 
     def run(self):
         if os.path.exists(SOCKET_PATH):
