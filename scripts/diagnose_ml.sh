@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Logs de ml_server/ml_proxy en tiempo real (ver test_ml_pipeline.sh)
+export PYTHONUNBUFFERED=1
+
 # diagnose_ml.sh — Diagnose ML pipeline issues
 # Usage: ./scripts/diagnose_ml.sh
 

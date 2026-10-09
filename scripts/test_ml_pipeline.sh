@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Logs de ml_server/ml_proxy en tiempo real: sin esto, tracebacks y
+# "Error en conexión" del proxy quedan atrapados en el buffer de
+# stdout y nunca llegan al .log (parecen vacíos "sin errores").
+export PYTHONUNBUFFERED=1
+
 # test_ml_pipeline.sh — Automated ML feature logging test
 # Runs the complete pipeline: ml_server -> ml_proxy -> FUSE -> simulator
 # Usage: ./scripts/test_ml_pipeline.sh [label] [collect_rounds]

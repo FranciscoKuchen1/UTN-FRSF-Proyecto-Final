@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Logs de ml_server/ml_proxy en tiempo real (ver test_ml_pipeline.sh)
+export PYTHONUNBUFFERED=1
+
 # quick_test_ml.sh — Quick ML pipeline test (assumes project is already built)
 # Usage: ./scripts/quick_test_ml.sh [label]
 #   label: 1=ransomware (default), 0=benign

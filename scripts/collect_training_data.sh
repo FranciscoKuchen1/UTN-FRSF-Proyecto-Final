@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Logs de ml_server/ml_proxy en tiempo real (ver test_ml_pipeline.sh)
+export PYTHONUNBUFFERED=1
+
 # collect_training_data.sh — Recolecta datos de entrenamiento ML etiquetados
 # Uso: ./scripts/collect_training_data.sh [rounds]
 #   rounds: iteraciones por fase (default: 10)
