@@ -153,6 +153,7 @@ def evaluate(detector: RansomwareDetector, X, y, groups):
         y_prob = pipe.predict_proba(X[te])[:, 1]
 
         print(classification_report(y[te], y_pred,
+                                    labels=[0, 1],
                                     target_names=["Benigno", "Ransomware"],
                                     zero_division=0))
         if len(set(y[te])) == 2:
