@@ -413,8 +413,22 @@ static int gfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     while ((de = readdir(dp)) != NULL) {
         struct stat st;
         memset(&st, 0, sizeof(st));
-        st.st_ino  = de->d_ino;
-        st.st_mode = de->d_type << 12;
+        /* Stat COMPLETO por entrada: con FUSE_FILL_DIR_PLUS el kernel
+         * instala y cachea estos attrs durante attr_timeout. Un stat
+         * parcial (solo st_mode = d_type << 12) hacía que stats dentro
+         * de la ventana de caché devolvieran mode 000, uid 0 y mtime
+         * epoch — visible en ls y, peor, replicado por herramientas
+         * que copian DESDE el mount (rsync -a creaba destinos con
+         * mode 0, mtime 0; un dir 000 no se puede ni borrar). */
+        char full[PATH_MAX];
+        int fn = snprintf(full, sizeof(full), "%s/%s", rpath, de->d_name);
+        if (fn < 0 || fn >= (int)sizeof(full) ||
+            lstat(full, &st) < 0) {
+            /* Entrada desaparecida a mitad de listing o path truncado:
+             * fallback mínimo */
+            st.st_ino  = de->d_ino;
+            st.st_mode = de->d_type << 12;
+        }
         if (filler(buf, de->d_name, &st, 0, FUSE_FILL_DIR_PLUS))
             break;
     }
@@ -456,6 +470,89 @@ static int gfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
     return ret == 0 ? 0 : -errno;
 }
 
+/* ── Operaciones passthrough menores ──
+ * Sin estos handlers FUSE responde ENOSYS y herramientas comunes fallan
+ * dentro del mount: cp hace fchmod para copiar el modo del origen, y
+ * mkdir -p corrige permisos cuando el modo creado difiere del pedido
+ * (p.ej. umask del daemon ≠ umask del cliente). El síntoma era
+ * "mkdir: cannot set permissions ...: Function not implemented" —
+ * la fase benigna de collect_training_data.sh moría en la ronda 1. */
+
+static int gfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    char rp[PATH_MAX];
+    real_path(rp, path);
+    int ret = (fi && fi->fh) ? fchmod((int)fi->fh, mode) : chmod(rp, mode);
+    return ret == 0 ? 0 : -errno;
+}
+
+static int gfs_chown(const char *path, uid_t uid, gid_t gid,
+                     struct fuse_file_info *fi) {
+    char rp[PATH_MAX];
+    real_path(rp, path);
+    /* lchown (no deref) por ruta: consistente con un proxy que no
+     * sigue symlinks en las demás ops por ruta */
+    int ret = (fi && fi->fh) ? fchown((int)fi->fh, uid, gid)
+                             : lchown(rp, uid, gid);
+    return ret == 0 ? 0 : -errno;
+}
+
+static int gfs_utimens(const char *path, const struct timespec tv[2],
+                       struct fuse_file_info *fi) {
+    char rp[PATH_MAX];
+    real_path(rp, path);
+    int ret = (fi && fi->fh) ? futimens((int)fi->fh, tv)
+                             : utimensat(AT_FDCWD, rp, tv, AT_SYMLINK_NOFOLLOW);
+    return ret == 0 ? 0 : -errno;
+}
+
+static int gfs_rmdir(const char *path) {
+    char rp[PATH_MAX];
+    real_path(rp, path);
+    return rmdir(rp) < 0 ? -errno : 0;
+}
+
+static int gfs_statfs(const char *path, struct statvfs *stbuf) {
+    char rp[PATH_MAX];
+    real_path(rp, path);
+    return statvfs(rp, stbuf) < 0 ? -errno : 0;
+}
+
+static int gfs_access(const char *path, int mask) {
+    char rp[PATH_MAX];
+    real_path(rp, path);
+    return access(rp, mask) < 0 ? -errno : 0;
+}
+
+static int gfs_readlink(const char *path, char *buf, size_t size) {
+    char rp[PATH_MAX];
+    real_path(rp, path);
+    ssize_t n = readlink(rp, buf, size - 1);
+    if (n < 0) return -errno;
+    buf[n] = '\0';
+    return 0;
+}
+
+static int gfs_symlink(const char *target, const char *linkpath) {
+    char rp[PATH_MAX];
+    real_path(rp, linkpath);
+    return symlink(target, rp) < 0 ? -errno : 0;
+}
+
+static int gfs_fsync(const char *path, int isdatasync,
+                     struct fuse_file_info *fi) {
+    (void)path;
+    if (!fi || !fi->fh) return 0;
+    int ret = isdatasync ? fdatasync((int)fi->fh) : fsync((int)fi->fh);
+    return ret == 0 ? 0 : -errno;
+}
+
+static int gfs_flush(const char *path, struct fuse_file_info *fi) {
+    /* Los writes ya fueron al fd del backend vía pwrite — nada pendiente
+     * del lado userspace en cada close(2). */
+    (void)path; (void)fi;
+    return 0;
+}
+
 static const struct fuse_operations guardian_ops = {
     .getattr  = gfs_getattr,
     .open     = gfs_open,
@@ -468,11 +565,27 @@ static const struct fuse_operations guardian_ops = {
     .create   = gfs_create,
     .release  = gfs_release,
     .truncate = gfs_truncate,
+    .chmod    = gfs_chmod,
+    .chown    = gfs_chown,
+    .utimens  = gfs_utimens,
+    .rmdir    = gfs_rmdir,
+    .statfs   = gfs_statfs,
+    .access   = gfs_access,
+    .readlink = gfs_readlink,
+    .symlink  = gfs_symlink,
+    .fsync    = gfs_fsync,
+    .flush    = gfs_flush,
 };
 
 int main(int argc, char *argv[]) {
     /* Inicialización */
     log_init();
+    /* Pass-through de modos: la VFS ya aplica el umask del CLIENTE al
+     * `mode` que llega en mkdir/create. Si el daemon dejara su propio
+     * umask encima, los permisos resultantes difieren de los pedidos y
+     * cp/mkdir intentan corregirlos con chmod (ENOSYS sin handler →
+     * "Function not implemented"). */
+    umask(0);
     g_shadow         = getenv_bool("GUARDIAN_SHADOW_MODE");
     gstate.real_root   = get_env_or("GUARDIAN_REAL_ROOT", "/zpool/data");
     gstate.zfs_dataset = get_env_or("GUARDIAN_ZFS_DATASET", "tank/data");

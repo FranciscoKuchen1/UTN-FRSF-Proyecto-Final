@@ -125,6 +125,23 @@ Los mensajes de commit siguen [Conventional Commits](https://www.conventionalcom
   `target_compile_definitions`).
 
 ### Fixed
+- **Handlers FUSE passthrough faltantes (guardian_fs.c)**: sin
+  `chmod`/`chown`/`utimens`/`rmdir`/`statfs`/`access`/`readlink`/`symlink`/
+  `fsync`/`flush` el kernel devolvía ENOSYS y herramientas comunes fallaban
+  dentro del mount con "Function not implemented" (`mkdir -p` corrigiendo
+  permisos, `cp` con `fchmod`, `tar`/`rsync` restaurando tiempos). Además el
+  daemon aplicaba su propio umask encima del del cliente (modos resultantes
+  ≠ pedidos → chmod correctivo → ENOSYS); ahora `umask(0)` al arrancar
+  (la VFS ya aplicó el umask del cliente al `mode` que llega). Síntoma:
+  la fase benigna de `collect_training_data.sh` moría en la ronda 1.
+- **Attrs parciales en `readdir` con `FUSE_FILL_DIR_PLUS` (guardian_fs.c)**:
+  el filler recibía un `struct stat` con solo `st_mode = d_type << 12` y el
+  kernel **cacheaba** esos attrs durante el attr timeout → `ls` mostraba
+  `---------- root root Jan 1 1970` y, peor, herramientas que copian DESDE
+  el mount leían mode 0/uid 0/mtime epoch y los replicaban al destino:
+  `rsync -a` creaba archivos y directorios con mode 000 (un dir 000 no se
+  puede ni vaciar → `rm -rf` del cleanup fallaba). Ahora cada entrada se
+  `lstat`-ea completo antes de pasarla al filler.
 - **Leakage en la evaluación ML (train_model.py)**: SMOTE y StandardScaler se
   aplicaban a TODO el dataset antes del CV → ROC-AUC inflado (muestras
   sintéticas derivadas del fold de test dentro del propio fold; estadísticos
