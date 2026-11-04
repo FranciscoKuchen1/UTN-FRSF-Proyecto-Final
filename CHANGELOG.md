@@ -12,6 +12,19 @@ Los mensajes de commit siguen [Conventional Commits](https://www.conventionalcom
 ## [Unreleased]
 
 ### Added
+- **Workloads benignos diversos en `collect_training_data.sh`** (antes solo
+  copias/tar/appends): compilación gcc, operaciones git (init/add/commit),
+  rsync, appenders paralelos (PIDs propios), reescritura de archivo con
+  contenido idéntico, `dd` zero-filled, escritor de bloques idénticos
+  (heartbeat/páginas de DB) y compresión de datos POCO comprimibles
+  (base64 de urandom — simula archivar media/backup ya comprimido). Las
+  clases faltantes generaban FPs reales del modelo: "entropía constante"
+  (autocorr≈1 solo existía en ataques → FP con writers de bloques
+  idénticos) y "bulk writer de alta entropía sin renames" (0 rows benignas
+  con entropy_mean>7 → FP con gzip). Con el dataset completo (1805 muestras,
+  1541/264, 127 sesiones) el ensemble queda en ROC-AUC 1.000 (RF) /
+  0.9997 (XGB) con holdout agrupado por sesión, y los probes de las clases
+  difíciles pasan a `normal` (gzip: 0.94 → 0.43).
 - **Freno global anti-evasión multiproceso (detector.c)**: un ransomware que
   forkea N workers diluye el scoring per-PID (cada worker queda bajo todos los
   umbrales). El detector agrega por ventana las escrituras con **firma de
@@ -152,6 +165,10 @@ Los mensajes de commit siguen [Conventional Commits](https://www.conventionalcom
   ataques pasaron de ~1 a ~3 ventanas/ronda en la recolección.
   `tests/test_analyzer.c` actualizado a la nueva semántica (retención sin
   ML + liberación al vencer la retención).
+- **Carrera en el arranque del ml_server (collect_training_data.sh)**: con
+  modelos entrenados el server importa sklearn+xgboost y carga los `.pkl`
+  antes de bindear (~4-5s en VM chica); el poll de 5s perdía la carrera y
+  abortaba la recolección entera. Ahora espera hasta 15s.
 - **Leakage en la evaluación ML (train_model.py)**: SMOTE y StandardScaler se
   aplicaban a TODO el dataset antes del CV → ROC-AUC inflado (muestras
   sintéticas derivadas del fold de test dentro del propio fold; estadísticos

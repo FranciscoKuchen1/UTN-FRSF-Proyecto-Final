@@ -89,7 +89,10 @@ start_server() {
     rm -f /tmp/guardian_ml.sock
     "$PYTHON" "$PROJECT_ROOT/src/ml_server.py" > "$LOG_DIR/collect_ml_server.log" 2>&1 &
     ML_SERVER_PID=$!
-    for _ in {1..10}; do
+    # 15s: con modelos entrenados el server importa sklearn+xgboost y
+    # carga los .pkl antes de bindear (~4-5s en VM chica, más bajo carga);
+    # con 5s el poll perdía la carrera y abortaba la recolección entera.
+    for _ in $(seq 1 30); do
         if ! kill -0 "$ML_SERVER_PID" 2>/dev/null; then
             log_error "ML server died. Check: $LOG_DIR/collect_ml_server.log"
             cat "$LOG_DIR/collect_ml_server.log"
@@ -210,7 +213,10 @@ attack_round() {
     log_info "  Attack round $r/$ROUNDS (mode=$mode, files=$count, pause=${pause}ms, workers=$workers, partial=${partial}%)"
     "$PYTHON" "$SCRIPT_DIR/simulate_ransomware.py" "${args[@]}" \
         > "$LOG_DIR/collect_attack_round$r.log" 2>&1 || true
-    sleep 6
+    # 12s: las ventanas del ataque (incl. workers ya muertos) experan a
+    # +5s del último write; 6s las dejaba en la frontera del swap de
+    # proxy y se perdían las últimas ventanas de cada ronda.
+    sleep 12
 }
 
 benign_round() {
@@ -221,11 +227,46 @@ benign_round() {
     start_proxy 0 "ben_r${r}"
     mkdir -p "$wd"
 
+    # Copias y backup (lecturas + escrituras secuenciales de bytes
+    # estructurados — texto/ELF, entropía baja-media)
     cp -r "$PROJECT_ROOT/src" "$wd/src" 2>/dev/null || true
     cp -r "$PROJECT_ROOT/docs" "$wd/docs" 2>/dev/null || true
     tar czf "$wd/backup.tar.gz" -C "$PROJECT_ROOT" README.md 2>/dev/null || true
+    cp /usr/bin/bash "$wd/bash_copy" 2>/dev/null || true
 
+    # Variedad de workloads benignos (docs/ml-architecture.md §6.3):
+    # cada uno corre con PIDs propios → más ventanas/features por ronda
+    # y cobertura de los patrones que generan FPs en el detector C.
     local i
+
+    # 1) Compilación: gcc escribe .o/binarios — entropía media-alta,
+    #    el clásico "entropía alta ≠ ataque"
+    cat > "$wd/hello.c" <<'EOF'
+#include <stdio.h>
+#include <string.h>
+int main(void) {
+    char msg[] = "hello guardian";
+    for (int i = 0; msg[i]; i++) msg[i] += 1;
+    puts(msg);
+    return 0;
+}
+EOF
+    gcc -O2 -o "$wd/hello" "$wd/hello.c" 2>/dev/null || true
+
+    # 2) Git: init/add/commit → ráfagas de writes chicos, renames y
+    #    unlinks internos en .git (reorganización de archivos, benigna)
+    mkdir -p "$wd/repo"
+    git -C "$wd/repo" init -q 2>/dev/null || true
+    cp "$PROJECT_ROOT/README.md" "$wd/repo/" 2>/dev/null || true
+    printf 'lab note round %s\n' "$r" > "$wd/repo/note.txt"
+    git -C "$wd/repo" add . 2>/dev/null || true
+    git -C "$wd/repo" -c user.email=lab@guardian -c user.name=lab \
+        commit -qm "round $r" 2>/dev/null || true
+
+    # 3) rsync: sincronización de directorio (reads+writes balanceados)
+    rsync -a --quiet "$wd/src" "$wd/src_mirror" 2>/dev/null || true
+
+    # 4) Appenders tipo apps reales: logs/csv en ráfaga
     for i in $(seq 1 40); do
         echo "$(date +%s%N) INFO processing record $i batch $r" >> "$wd/app.log"
     done
@@ -233,11 +274,65 @@ benign_round() {
         printf 'id,name,value,note\n%d,item_%d,%d,some text %d\n' "$i" "$i" "$((i * 37))" "$i" >> "$wd/data.csv"
     done
 
+    # 5) Appenders paralelos (PIDs propios → más ventanas por ronda)
+    local ap1 ap2
+    ( for i in $(seq 1 30); do \
+        printf '%s metric_%s=%s\n' "$(date +%s%N)" "$i" "$((RANDOM % 100))" >> "$wd/metrics.log"; \
+      done ) & ap1=$!
+    ( for i in $(seq 1 30); do \
+        printf 'event,%s,type_%s\n' "$i" "$((i % 7))" >> "$wd/events.csv"; \
+      done ) & ap2=$!
+    wait "$ap1" "$ap2"
+
+    # Lecturas (alimentan read_write_ratio)
     cat "$wd/app.log" > /dev/null 2>&1 || true
     head -5 "$wd/data.csv" > /dev/null 2>&1 || true
 
-    cp /usr/bin/bash "$wd/bash_copy" 2>/dev/null || true
-    sleep 6
+    # 6) Compresión/backup de datos POCO comprimibles: entropía ALTA
+    #    benigna con muchas escrituras por ventana. Ojo con el input: si
+    #    el contenido es repetitivo (p.ej. 40 copies del mismo source),
+    #    gzip lo comprime 40:1 y hace 1-2 writes → nunca supera los 10
+    #    writes/ventana y la clase no llega al dataset (0 rows benignas
+    #    con entropy_mean>7 → FP con bulk writers de media/comprimidos).
+    #    base64(urandom) simula copiar/archivar .jpg/.zip/.mp4/backup
+    #    ya cifrado: ~3MB que gzip apenas puede comprimir.
+    head -c 3145728 /dev/urandom | base64 > "$wd/big_rand.txt" 2>/dev/null || true
+    gzip -c "$wd/big_rand.txt" > "$wd/big_rand.gz" 2>/dev/null || true
+    tar czf "$wd/backup.tar.gz" -C "$wd" big_rand.txt src docs 2>/dev/null || true
+    gzip -c "$wd/app.log" > "$wd/app.log.gz" 2>/dev/null || true
+
+    # 7) Escritores de entropía CONSTANTE benigna (autocorr≈1): en el
+    #    dataset original esa firma temporal sólo aparecía en ataques y
+    #    el modelo daba FP con procesos que escriben bloques idénticos
+    #    (heartbeats, páginas de DB, padding de imágenes). Casos reales
+    #    benignos con entropía uniforme en el tiempo:
+    "$PYTHON" -c "
+import sys, os
+wd = sys.argv[1]
+data = b'heartbeat ok ' * 298
+for i in range(30):
+    with open(os.path.join(wd, 'const_%02d.bin' % i), 'wb') as f:
+        f.write(data)
+" "$wd" 2>/dev/null || true
+
+    # 8) zero-filled (dd): entropía 0 constante — archivos sparse/padding
+    dd if=/dev/zero of="$wd/zerofill.bin" bs=64k count=30 2>/dev/null || true
+
+    # 9) Reescritura del mismo archivo con contenido idéntico: alto
+    #    write_rate + autocorr 1.0, sin renames ni cambio de extensión
+    "$PYTHON" -c "
+import sys, os
+wd = sys.argv[1]
+data = b'x' * 262144
+for i in range(20):
+    with open(os.path.join(wd, 'rewrite.bin'), 'wb') as f:
+        f.write(data)
+" "$wd" 2>/dev/null || true
+
+    # 12s: margen para que las ventanas del final de la ronda (experan a
+    # +5s del último write) flusheen ANTES del swap de proxy de la ronda
+    # siguiente — con 6s quedaban justo en la frontera y se perdían.
+    sleep 12
 }
 
 main() {
