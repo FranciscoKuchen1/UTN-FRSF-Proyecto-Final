@@ -243,7 +243,15 @@ static void reset_window(pid_stats_t *s, time_t now) {
  * procesos ya matados por la mitigación.
  * PIDs cuya ventana venció sin actividad suficiente liberan su slot: sin
  * esto la tabla se llena con procesos muertos y las features ML se pierden
- * en silencio para siempre (incluido un atacante nuevo). */
+ * en silencio para siempre (incluido un atacante nuevo).
+ * Si el query ML falla (proxy en swap entre rondas de recolección, server
+ * caído), la ventana NO se descarta: se retiene y se reintenta en el
+ * próximo flush con la conexión restaurada (tope ML_RETAIN_SECS para no
+ * llenar la tabla si el ML no vuelve). Antes el reset era incondicional y
+ * se perdía justo la primera tanda de ventanas tras cada restart del
+ * proxy — incluidas las de procesos recién matados por la mitigación. */
+#define ML_RETAIN_SECS 30
+
 static void flush_expired_windows(int *ml_fd) {
     time_t now = time(NULL);
 
@@ -253,7 +261,12 @@ static void flush_expired_windows(int *ml_fd) {
         if (!s->active || now - s->window_start < ML_WINDOW_SECS)
             continue;
 
-        if (s->write_count >= 10 && *ml_fd >= 0) {
+        if (s->write_count < 10) {
+            memset(s, 0, sizeof(*s));       /* active = 0 → slot libre */
+            continue;
+        }
+
+        if (*ml_fd >= 0) {
             int verdict = ml_query(*ml_fd, s->pid, s);
             if (verdict < 0) {
                 close(*ml_fd);
@@ -266,10 +279,16 @@ static void flush_expired_windows(int *ml_fd) {
                 detector_confirm_attack(detector, s->pid);
             }
         }
-        if (s->write_count < 10)
-            memset(s, 0, sizeof(*s));       /* active = 0 → slot libre */
-        else
-            reset_window(s, now);
+
+        if (*ml_fd < 0) {
+            /* Sin ML: retener y reintentar; vencida la retención,
+             * liberar (evita llenar la tabla con un ML caído) */
+            if (now - s->window_start > ML_RETAIN_SECS)
+                memset(s, 0, sizeof(*s));
+            continue;
+        }
+
+        reset_window(s, now);
     }
     pthread_mutex_unlock(&pid_mutex);
 }

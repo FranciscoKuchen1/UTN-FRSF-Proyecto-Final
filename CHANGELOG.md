@@ -142,6 +142,16 @@ Los mensajes de commit siguen [Conventional Commits](https://www.conventionalcom
   `rsync -a` creaba archivos y directorios con mode 000 (un dir 000 no se
   puede ni vaciar → `rm -rf` del cleanup fallaba). Ahora cada entrada se
   `lstat`-ea completo antes de pasarla al filler.
+- **Pérdida de ventanas ML en fallas de conexión (analyzer.c)**: si el query
+  al proxy fallaba (swap de proxy entre rondas de recolección, server
+  caído), `flush_expired_windows` reseteaba la ventana igual — se perdían
+  justo las primeras ventanas tras cada restart del proxy, incluidas las
+  de procesos recién matados por la mitigación. Ahora la ventana se
+  **retiene y reintenta** con la conexión restaurada (tope `ML_RETAIN_SECS`
+  = 30s para no llenar la `pid_table` si el ML no vuelve). Con esto los
+  ataques pasaron de ~1 a ~3 ventanas/ronda en la recolección.
+  `tests/test_analyzer.c` actualizado a la nueva semántica (retención sin
+  ML + liberación al vencer la retención).
 - **Leakage en la evaluación ML (train_model.py)**: SMOTE y StandardScaler se
   aplicaban a TODO el dataset antes del CV → ROC-AUC inflado (muestras
   sintéticas derivadas del fold de test dentro del propio fold; estadísticos

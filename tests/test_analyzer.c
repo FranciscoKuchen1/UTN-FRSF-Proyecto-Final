@@ -214,7 +214,10 @@ static void test_get_slot_does_not_rotate_expired(void) {
     ASSERT_EQ(s2->write_count, 25ULL);
 }
 
-/* Window expired → flush resets stats to zero */
+/* Window expired PERO sin ML (ml_fd = -1): la ventana se RETIENE para
+ * reintentar cuando la conexión vuelva (swap de proxy entre rondas de
+ * recolección, server caído) — antes se reseteaba incondicionalmente y
+ * las features se perdían. Campos intactos, slot activo. */
 static void test_window_rotation_expired(void) {
     reset_table();
     pthread_mutex_lock(&pid_mutex);
@@ -233,12 +236,13 @@ static void test_window_rotation_expired(void) {
 
     flush_no_ml();
 
-    ASSERT_EQ(s->write_count,  0ULL);
-    ASSERT_EQ(s->total_bytes,  0ULL);
-    ASSERT_EQ(s->entropy_sum,  0.0);
-    ASSERT_EQ(s->entropy_max,  0.0);
-    ASSERT_EQ(s->rename_count, 0ULL);
-    ASSERT_EQ(s->unlink_count, 0ULL);
+    /* Retenida: nada se pierde mientras no haya a dónde enviar */
+    ASSERT_EQ(s->write_count,  25ULL);
+    ASSERT_EQ(s->total_bytes,  100000ULL);
+    ASSERT_EQ(s->entropy_sum,  180.0);
+    ASSERT_EQ(s->entropy_max,  7.9);
+    ASSERT_EQ(s->rename_count, 12ULL);
+    ASSERT_EQ(s->unlink_count, 3ULL);
     ASSERT(s->active == 1);
     ASSERT_EQ((int)s->pid, 5100);
 }
@@ -269,7 +273,9 @@ static void test_window_rotation_still_active(void) {
     ASSERT_EQ(s->unlink_count, 1ULL);
 }
 
-/* Double rotation: flush twice with expired windows in between */
+/* Double flush sin ML: la primera retiene (nada se pierde); vencida la
+ * retención (age > ML_RETAIN_SECS) el slot se libera — la tabla no se
+ * llena si el ML no vuelve nunca. */
 static void test_window_double_rotation(void) {
     reset_table();
     pthread_mutex_lock(&pid_mutex);
@@ -283,21 +289,23 @@ static void test_window_double_rotation(void) {
     pthread_mutex_unlock(&pid_mutex);
 
     flush_no_ml();
-    ASSERT_EQ(s->write_count, 0ULL);
-    ASSERT_EQ(s->entropy_max, 0.0);
+    ASSERT_EQ(s->write_count, 20ULL);      /* retenida */
+    ASSERT_EQ(s->entropy_max, 8.0);
 
     pthread_mutex_lock(&pid_mutex);
     s->write_count  = 30;
     s->entropy_max  = 7.8;
-    s->window_start = time(NULL) - (ML_WINDOW_SECS + 5);
+    s->window_start = time(NULL) - (ML_RETAIN_SECS + 1);
     pthread_mutex_unlock(&pid_mutex);
 
     flush_no_ml();
-    ASSERT_EQ(s->write_count, 0ULL);
+    ASSERT_EQ(s->write_count, 0ULL);       /* retención vencida → libre */
     ASSERT_EQ(s->entropy_max, 0.0);
+    ASSERT_EQ(s->active, 0);
 }
 
-/* Window rotation at exact boundary (>= condition) */
+/* Window rotation at exact boundary (>= condition): expira exactamente
+ * a los ML_WINDOW_SECS — sin ML se retiene (no reset) */
 static void test_window_rotation_exact_boundary(void) {
     reset_table();
     pthread_mutex_lock(&pid_mutex);
@@ -305,16 +313,18 @@ static void test_window_rotation_exact_boundary(void) {
     pid_stats_t *s = get_slot(8000);
     ASSERT_NOT_NULL(s);
     s->write_count  = 15;
+    s->total_bytes  = 60000;
     s->window_start = time(NULL) - ML_WINDOW_SECS;
 
     pthread_mutex_unlock(&pid_mutex);
 
     flush_no_ml();
-    ASSERT_EQ(s->write_count, 0ULL);
-    ASSERT_EQ(s->total_bytes, 0ULL);
+    /* Expirada pero retenida (sin ML) */
+    ASSERT_EQ(s->write_count, 15ULL);
+    ASSERT_EQ(s->total_bytes, 60000ULL);
 }
 
-/* Rotation preserves active flag and PID */
+/* Retained window keeps identity (active + pid) while ML is down */
 static void test_window_rotation_preserves_identity(void) {
     reset_table();
     pthread_mutex_lock(&pid_mutex);
@@ -463,6 +473,8 @@ static void test_autocorr_needs_history(void) {
     ASSERT(compute_autocorr(s) == 0.0);
 }
 
+/* Ventana vencida SIN ML y con retención vencida (age > ML_RETAIN_SECS):
+ * el slot se libera y todos los campos quedan a cero (memset) */
 static void test_flush_resets_new_fields(void) {
     reset_table();
     pthread_mutex_lock(&pid_mutex);
@@ -477,7 +489,7 @@ static void test_flush_resets_new_fields(void) {
     s->hist_pos         = 5;
     s->dir_count        = 3;
     s->ext_count        = 2;
-    s->window_start     = time(NULL) - (ML_WINDOW_SECS + 1);
+    s->window_start     = time(NULL) - (ML_RETAIN_SECS + 1);
     pthread_mutex_unlock(&pid_mutex);
 
     flush_no_ml();
@@ -491,7 +503,7 @@ static void test_flush_resets_new_fields(void) {
     ASSERT_EQ(s->hist_count, 0U);
     ASSERT_EQ(s->dir_count, 0U);
     ASSERT_EQ(s->ext_count, 0U);
-    ASSERT_EQ(s->active, 1);
+    ASSERT_EQ(s->active, 0);
 }
 
 static void test_get_slot_reuse_zeroes_stale(void) {
