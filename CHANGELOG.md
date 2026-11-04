@@ -125,6 +125,15 @@ Los mensajes de commit siguen [Conventional Commits](https://www.conventionalcom
   - Tracking de entropía máxima.
 
 ### Changed
+- **Documentación reescrita para lectores humanos**: README, guía de
+  desarrolladores, guía de ML, guía de testing y arquitectura se
+  reescribieron en lenguaje claro (cada término técnico se explica la
+  primera vez que aparece, con analogías y ejemplos concretos en lugar de
+  jerga). Documentos nuevos: `docs/tests.md` (qué verifica cada uno de los
+  61 tests, agrupados por módulo), `docs/pipeline.md` (diagramas del
+  flujo: sistema montado, decisión por escritura, circuito de datos ML y
+  recuperación) y `docs/cambios-2026-11-04.md` (bitácora de la puesta en
+  marcha completa: cambios, métricas, errores encontrados y soluciones).
 - **Script de montaje mejorado (scripts/mount.sh)**: Validación de argumentos, resolución
   de rutas absolutas, unmount automático si ya montado, creación de directorio de logs,
   export de variables de entorno `GUARDIAN_REAL_ROOT` y `GUARDIAN_ZFS_DATASET`.

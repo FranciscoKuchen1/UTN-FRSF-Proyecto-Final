@@ -1,166 +1,44 @@
-# Feature Logger para Guardian FS
+# El dataset de entrenamiento
 
-Sistema de recolección de datos para entrenamiento del modelo ML.
+Acá vive el dataset que alimenta al modelo de machine learning. Se genera con los scripts del proyecto — **no se commitea al repo** (está gitignoreado).
 
-## Componentes
+## Qué hay en `data/training_data.csv`
 
-1. **`feature_logger.py`** - Módulo Python para loggear features en CSV
-2. **`ml_proxy.py`** - Proxy que intercepta features entre analyzer.c y ml_server.py
+Una fila por **ventana de 5 segundos** de actividad de un programa, con 14 señales de comportamiento, la etiqueta y la metadata:
 
-## Flujo de Datos
+| Columnas | Contenido |
+|---|---|
+| Las 14 primeras | Señales del programa en esa ventana (entropía, velocidad, renombrados, carpetas recorridas… el significado de cada una está en [`docs/ml-architecture.md`](../docs/ml-architecture.md) §2) |
+| `label` | `0` = actividad benigna, `1` = ataque |
+| `session` | Qué ronda de recolección generó la fila (para evaluar sin trampas) |
+| `timestamp`, `pid` | Cuándo y qué programa |
+
+## Cómo se genera
+
+No se anota a mano. El circuito automático es:
 
 ```
-┌─────────────┐         ┌──────────────┐         ┌─────────────┐
-│ analyzer.c  │ ──────> │  ML Proxy    │ ──────> │ ml_server.py│
-│ (FUSE)      │ <────── │ (loggea)     │ <────── │ (inference) │
-└─────────────┘         └──────────────┘         └─────────────┘
-                               │
-                               ▼
-                        ┌──────────────┐
-                        │ training_    │
-                        │ data.csv     │
-                        └──────────────┘
+programa escribe → FUSE → analyzer (resumen de la ventana)
+    → ml_proxy (ANOTA la fila en el CSV con la etiqueta de la ronda)
+    → ml_server (sigue su curso normal)
 ```
 
-## Uso
-
-### Opción 1: Proxy Interceptor (Recomendado)
-
-Este método intercepta las features en tiempo real mientras corre el simulador.
-
-**Paso 1: Preparar el entorno**
+El intermediario (`scripts/ml_proxy.py`) es la "máquina de anotar": cada ventana que viaja hacia el modelo queda registrada con la etiqueta de la ronda que estaba corriendo (ataque o workload benigno).
 
 ```bash
-# Asegúrate de que ml_server.py esté corriendo
-python3 src/ml_server.py &
+# El comando que hace todo (rondas de ataque + benignas, en modo sombra):
+./scripts/collect_training_data.sh 25
 
-# Cambiar el socket en analyzer.c temporalmente:
-# En src/analyzer.c, línea 23:
-# #define ML_SOCKET_PATH "/tmp/guardian_ml_proxy.sock"
-```
-
-**Paso 2: Iniciar el proxy**
-
-```bash
-# Para datos de ransomware (label=1)
-python3 scripts/ml_proxy.py --label 1 --output data/ransomware_samples.csv
-
-# Para datos benignos (label=0)
-python3 scripts/ml_proxy.py --label 0 --output data/benign_samples.csv
-```
-
-**Paso 3: Correr el simulador**
-
-```bash
-# Ataque rápido
-python3 scripts/simulate_ransomware.py --target-dir /tmp/test_data --file-count 100
-
-# Ataque sigiloso
-python3 scripts/simulate_ransomware.py --target-dir /tmp/test_data \
-    --mode stealth --file-count 50 --pause-ms 200
-```
-
-**Paso 4: Combinar datasets**
-
-```bash
-# Unir ransomware + benigno
-cat data/ransomware_samples.csv data/benign_samples.csv > data/features_labeled.csv
-# (asegúrate de mantener solo un header)
-```
-
-### Opción 2: Logger Manual (Para testing)
-
-```python
-from data.feature_logger import FeatureLogger
-
-# Crear logger
-logger = FeatureLogger(
-    output_path="data/test_samples.csv",
-    label=1  # 1=ransomware, 0=benigno
-)
-
-# Loggear features
-features = {
-    "entropy_mean": 7.5,
-    "entropy_max": 7.9,
-    "write_rate": 150.0,
-    "rename_rate": 20.0,
-    # ... otras features
-}
-
-logger.log(features)
-```
-
-## Formato del CSV
-
-El CSV generado tiene este formato (compatible con `train_model.py`):
-
-```csv
-entropy_mean,entropy_max,entropy_std,entropy_autocorr,write_rate,bytes_written_rate,rename_rate,unlink_rate,read_write_ratio,chi2_stat,ext_change_rate,canary_accessed,unique_dirs,file_type_variety,label,timestamp,pid
-7.5,7.9,0.2,0.0,150.0,45000.0,20.0,5.0,0.5,1e9,0.8,0,3,2,1,2026-08-30T21:00:00,12345
-```
-
-**Features:**
-- `entropy_mean` - Entropía media de escrituras
-- `entropy_max` - Máxima entropía en ventana
-- `entropy_std` - Desviación estándar de entropía
-- `entropy_autocorr` - Autocorrelación temporal
-- `write_rate` - Escrituras/segundo
-- `bytes_written_rate` - Bytes/segundo
-- `rename_rate` - Renombrados/segundo
-- `unlink_rate` - Eliminaciones/segundo
-- `read_write_ratio` - Ratio lectura/escritura
-- `chi2_stat` - Estadístico chi-cuadrado
-- `ext_change_rate` - Tasa de cambio de extensión
-- `canary_accessed` - ¿Accedió a canary? (0/1)
-- `unique_dirs` - Directorios únicos accedidos
-- `file_type_variety` - Variedad de tipos de archivo
-
-**Metadata:**
-- `label` - 0=benigno, 1=ransomware
-- `timestamp` - ISO 8601
-- `pid` - Process ID
-
-## Generar Dataset Completo
-
-```bash
-# 1. Crear directorio de prueba
-mkdir -p /tmp/guardian_test
-
-# 2. Generar datos benignos (uso normal)
-python3 scripts/ml_proxy.py --label 0 --output data/benign.csv &
-PROXY_PID=$!
-
-# Simular uso normal (copiar archivos, editar, etc.)
-cp -r /etc/skel /tmp/guardian_test/
-find /tmp/guardian_test -type f -exec grep -l "test" {} \;
-
-kill $PROXY_PID
-
-# 3. Generar datos maliciosos (ransomware)
-python3 scripts/ml_proxy.py --label 1 --output data/ransomware.csv &
-PROXY_PID=$!
-
-# Correr simulador
-python3 scripts/simulate_ransomware.py \
-    --target-dir /tmp/guardian_test \
-    --file-count 200 \
-    --mode full
-
-kill $PROXY_PID
-
-# 4. Combinar datasets
-head -1 data/benign.csv > data/features_labeled.csv
-tail -n +2 data/benign.csv >> data/features_labeled.csv
-tail -n +2 data/ransomware.csv >> data/features_labeled.csv
-
-# 5. Entrenar modelo
+# Después de recolectar, entrenar:
 python3 src/train_model.py
 ```
 
-## Notas
+Más variedad de workloads benignos = mejor modelo. Las rondas benignas ya incluyen los casos difíciles (compresión de archivos grandes, compilación, git, rsync, bloques idénticos, archivos de ceros) — el porqué de cada uno está en la [guía de ML](../docs/ml-architecture.md) §4.
 
-- El proxy debe correrse **después** de ml_server.py
-- analyzer.c debe apuntar al socket del proxy (`/tmp/guardian_ml_proxy.sock`)
-- Los CSV pueden ser grandes; no los subas a git (ya están en .gitignore)
-- Para producción, considera rotar logs y comprimir datos antiguos
+## Archivos de este directorio
+
+| Archivo | Rol |
+|---|---|
+| `training_data.csv` | El dataset (se genera, no se commitea) |
+| `feature_logger.py` | Módulo de anotación que usa el proxy |
+| `README.md` | Esta página |

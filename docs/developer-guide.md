@@ -1,519 +1,206 @@
-# Guardian FS — Guía para Desarrolladores y Dirección
+# Guía para desarrolladores
 
-> Proyecto Final UTN FRSF 2026  
-> Gómez Enrico, Ivo · Kuchen, Francisco  
-> Director: Dr. Pablo Pessolani · Codirector: Ing. David Harispe  
-> Versión: v0.2.0-dev | Junio 2026
+> Cómo está armado Guardian FS por adentro, para quien va a leer o modificar el código. Si recién llegás al proyecto, empezá por el [`README.md`](../README.md) y los [diagramas](pipeline.md). La guía de tests está [acá](tests.md).
 
 ---
 
-## Índice
+## 1. El problema que resuelve el código
 
-1. [El Problema](#1-el-problema)
-2. [Nuestra Solución — Visión General](#2-nuestra-solución--visión-general)
-3. [Arquitectura: Cómo se Conecta Todo](#3-arquitectura-cómo-se-conecta-todo)
-4. [Módulo por Módulo](#4-módulo-por-módulo)
-   - [4.1 guardian_fs.c — El Proxy FUSE](#41-guardian_fsc--el-proxy-fuse)
-   - [4.2 entropy.c — Análisis Estadístico de Bytes](#42-entropyc--análisis-estadístico-de-bytes)
-   - [4.3 detector.c — Motor de Scoring por Comportamiento](#43-detectorc--motor-de-scoring-por-comportamiento)
-   - [4.4 canary.c — Archivos Señuelo](#44-canaryc--archivos-señuelo)
-   - [4.5 zfs_snap.c — Recuperación vía Snapshots ZFS](#45-zfs_snapc--recuperación-vía-snapshots-zfs)
-   - [4.6 ring_buffer.c — Buffer Circular Thread-Safe](#46-ring_bufferc--buffer-circular-thread-safe)
-   - [4.7 mitigation.c — Terminación del Proceso Atacante](#47-mitigationc--terminación-del-proceso-atacante)
-   - [4.8 analyzer.c — Hilo de Análisis Asíncrono](#48-analyzerc--hilo-de-análisis-asíncrono)
-5. [Flujo de Datos — El Camino Completo](#5-flujo-de-datos--el-camino-completo)
-6. [Build, Test y Deploy](#6-build-test-y-deploy)
-7. [Decisiones de Diseño y Trade-offs](#7-decisiones-de-diseño-y-trade-offs)
-8. [Trabajo Pendiente](#8-trabajo-pendiente)
+Un ransomware cifrador hace siempre lo mismo: recorre tus archivos, y por cada uno **lee** el contenido, **escribe** una versión cifrada y **renombra** el archivo (`.docx` → `.locked`).
+
+Ese primer paso deja una huella que no puede disimular: los datos cifrados son estadísticamente indistinguibles del ruido. Si medís "qué tan revueltos" están los bytes de un texto, da ~4 sobre 8; una foto comprimida da ~7; datos cifrados dan **7.9+ y parejos**, escritura tras escritura. Ningún archivo legítimo hace eso de forma sostenida.
+
+Las defensas tradicionales llegan tarde: el antivirus de firmas no conoce el ransomware nuevo, y el backup programado… también termina cifrado. La única ventana útil es **mientras el ransomware escribe**: ahí podés frenarlo antes de que el daño sea grande. Para pararse en ese punto exacto, Guardian usa **FUSE** — un mecanismo de Linux que deja implementar un filesystem como un programa normal, sin tocar el kernel. Nuestro filesystem es un "pasamanos": todo lo que llega, lo deja pasar… salvo que huela a ataque.
+
+**Y si igualmente algo se cifró** (los primeros archivos, antes de la detección), el disco real es ZFS, que saca "fotografías" del estado (snapshots) en forma instantánea y permite volver a cualquiera de ellas en ~1 segundo.
 
 ---
 
-## 1. El Problema
+## 2. El reparto de responsabilidades (quién hace qué)
 
-### ¿Qué hace el ransomware?
+```
+src/
+├── guardian_fs.c   ← EL PASAMANOS: recibe cada operación de archivo
+├── entropy.c       ← LA CALCULADORA: mide los datos escritos
+├── detector.c      ← EL GUARDIA: decide al instante (normal/sospechoso/bloquear)
+├── canary.c        ← LA TRAMPA: archivos señuelo
+├── ring_buffer.c   ← LA COLA: eventos esperando análisis de fondo
+├── analyzer.c      ← EL ANALISTA DE FONDO: resume ventanas de 5 s (para el ML)
+├── mitigation.c    ← EL MARTILLAZO: matar al proceso atacante
+├── zfs_snap.c      ← LA MÁQUINA DEL TIEMPO: snapshots y rollback
+├── ml_server.py    ← segunda opinión (modelos entrenados)
+└── train_model.py  ← entrenamiento de esos modelos
+```
 
-Un ransomware cifrador opera en tres fases:
+El criterio del reparto es **tiempo de reacción**:
 
-1. **Enumera** archivos del filesystem (orden alfabético, por extensión, o recursivo).
-2. **Lee** cada archivo y **escribe** una versión cifrada con alta entropía.
-3. **Renombra** — cambia `.docx` → `.docx.locked`, `.pdf` → `.pdf.enc`.
+| Camino | Corre | Debe tardar | Qué hace |
+|---|---|---|---|
+| **Síncrono** (dentro de la operación de escritura) | `guardian_fs` → `entropy` → `detector` | < 1 ms | Decide si la escritura pasa, y en ataque: bloquea, mata, fotografía |
+| **Asíncrono** (hilo de fondo, cada 5 s) | `ring_buffer` → `analyzer` → ML | no importa, el usuario no espera | Resume ventanas de cada programa; el ML refina; un "attack" confirmado bloquea al atacante en su próxima operación |
+| **Fondo permanente** | `zfs_snap` | — | Snapshot automático cada 60 s |
 
-La escritura de datos cifrados es la **huella digital inconfundible**: los bytes cifrados tienen entropía cercana a 8.0 bits/byte (el máximo teórico) y una distribución estadísticamente uniforme (test χ² bajo). Ningún archivo legítimo —ni siquiera un `.zip` o `.jpg`— alcanza sistemáticamente 7.8+ de entropía en escrituras consecutivas.
-
-### ¿Por qué los antivirus tradicionales fallan?
-
-| Técnica tradicional | Por qué falla contra ransomware moderno |
-|---|---|
-| **Firma de archivo** (hash del binario) | El ransomware muta su binario (polimorfismo). |
-| **Heurísticas de proceso** (API calls) | El ransomware moderno ofusca sus llamadas al sistema. |
-| **Análisis post-ejecución** | Cuando se detecta, los archivos ya están cifrados. |
-| **Backups periódicos** | El ransomware moderno también cifra las copias de seguridad. |
-
-La única ventana de detección efectiva es **en tiempo real, durante la syscall de escritura**, antes de que los bytes cifrados toquen el disco.
+La regla de oro del diseño: **nunca hacer nada lento en el camino síncrono**. Si `gfs_write` tardara 100 ms, el usuario lo sentiría en cada guardado de archivo.
 
 ---
 
-## 2. Nuestra Solución — Visión General
+## 3. Módulo por módulo
 
-Guardian FS es un **proxy de filesystem transparente** que se interpone entre las aplicaciones y el almacenamiento real. Cada syscall de escritura pasa por nuestro código **antes** de llegar al disco:
+### `guardian_fs.c` — el pasamanos
 
-```
-Aplicación → write() → [GUARDIAN FS] → ¿bloquear o permitir? → Disco ZFS
-```
+Implementa las operaciones de filesystem que FUSE le deriva (abrir, leer, escribir, renombrar, borrar, listar, permisos…). Para cada una hay una función `gfs_<operación>` que:
 
-Cuando detecta comportamiento de ransomware, Guardian FS:
-1. **Bloquea** la escritura (el ransomware recibe `-EPERM`).
-2. **Toma un snapshot ZFS** del estado previo al ataque.
-3. **Mata** el proceso atacante con `SIGKILL`.
+1. Traduce la ruta a la carpeta real del disco,
+2. registra el evento en la cola de fondo,
+3. y solo en las operaciones "sensibles" (escribir, renombrar, borrar, abrir señuelos) consulta al detector **antes** de ejecutar.
 
-**Ventajas de resolverlo así:**
-
-| Ventaja | Explicación |
-|---|---|
-| **Detección en tiempo real** | La decisión se toma dentro de la misma syscall, antes del write real. Latencia < 1ms. |
-| **Independiente del binario** | No importa qué ransomware es — detectamos el **comportamiento**, no la firma. |
-| **Recuperación instantánea** | Snapshots ZFS CoW: rollback en O(1) a metadatos. |
-| **Zero trust en el usuario** | No depende de que el usuario no abra adjuntos. La protección es sistémica. |
-| **Defensa en profundidad** | 3 capas: canary → scoring estadístico → ML ensemble. |
-| **Sin falsos positivos catastróficos** | El "bloqueo" es `EPERM`, no pérdida de datos; hay snapshot de respaldo. |
-
----
-
-## 3. Arquitectura: Cómo se Conecta Todo
-
-```
-Aplicación (usuario o ransomware)
-        │
-        │ syscall: write(path, buf, size)
-        ▼
-┌───────────────────────────────────────────────────┐
-│              guardian_fs.c (FUSE proxy)            │
-│                                                    │
-│  gfs_write() {                                     │
-│    1. entropy_shannon(buf)           ← entropy.c   │
-│    2. ring_buf_push(ev)              ← ring_buffer │
-│    3. detector_check_write(...)      ← detector.c  │
-│       │                                            │
-│       ├─ VERDICT_BLOCK:                            │
-│       │   ├─ zfs_snapshot_emergency() ← zfs_snap.c │
-│       │   ├─ mitigation_kill_process() ← mitigation│
-│       │   └─ return -EPERM                         │
-│       │                                            │
-│       └─ VERDICT_NORMAL:                           │
-│           └─ pwrite() → disco ZFS real             │
-│  }                                                 │
-│                                                    │
-│  gfs_open()  → canary_is_canary()    ← canary.c    │
-│  gfs_rename()→ detector_check_rename()← detector.c │
-│  gfs_unlink()→ canary detection + bloqueo          │
-└───────────────────────────────────────────────────┘
-        │
-        │ (background thread)
-        ▼
-┌───────────────────────────────────────────────────┐
-│              analyzer.c (async thread)             │
-│  - Consume ring_buffer vía ring_buf_try_pop()      │
-│  - Acumula stats por PID (ventana 5s)              │
-│  - Conecta a ml_server.py vía Unix socket          │
-│  - Reintenta conexión cada 5s si falla             │
-└───────────────────────────────────────────────────┘
-        │
-        │ (background thread, cada 60s)
-        ▼
-┌───────────────────────────────────────────────────┐
-│           zfs_snap.c (snapshot scheduler)          │
-│  - zfs snapshot tank/data@guardian_auto_<ts>      │
-│  - Retiene últimos 20, destruye el resto           │
-└───────────────────────────────────────────────────┘
-```
-
-**Hilos activos durante la ejecución:**
-
-| Hilo | Origen | Rol |
-|---|---|---|
-| Principal | `fuse_main()` | Atiende syscalls FUSE. Bloqueante. |
-| Analyzer | `pthread_create` en `main()` | Consume ring buffer en background. |
-| Snapshots | `zfs_snapshot_schedule()` | Dispara `zfs snapshot` cada N segundos. |
-
----
-
-## 4. Módulo por Módulo
-
-### 4.1 guardian_fs.c — El Proxy FUSE
-
-**Archivo:** `src/guardian_fs.c` (348 líneas)  
-**Rol:** Punto de entrada del sistema. Intercepta 11 operaciones FUSE.
-
-**¿Qué problema resuelve?** Es el "hombre en el medio" entre cualquier aplicación y el filesystem real. Sin esto, el ransomware escribe directamente en ZFS sin pasar por nuestro detector.
-
-**¿Por qué FUSE y no un módulo de kernel?**
-- Un bug en userspace no paniquea el kernel.
-- Desarrollo y debugging mucho más rápido (GDB, printf).
-- Fácil integración con Python/ML vía Unix socket.
-- La latencia extra (~2μs por syscall) es insignificante comparada con el I/O a disco.
-
-**Operaciones implementadas:**
-
-| Syscall | Handler | Qué hace |
-|---|---|---|
-| `write` | `gfs_write` | Calcula entropía → detector → bloquea o permite |
-| `rename` | `gfs_rename` | Detecta cambio de extensión → scoring |
-| `unlink` | `gfs_unlink` | Si es canary → bloqueo inmediato |
-| `open` | `gfs_open` | Si es canary: apertura para escritura → alerta fuerte; read-only → nota leve (anti-FP de backups) |
-| `read` | `gfs_read` | Registra evento (para ratio R/W) |
-| `getattr`, `readdir`, `mkdir`, `create`, `release`, `truncate` | Proxy directo | Pasan al filesystem subyacente sin análisis |
-
-**Pipeline de `gfs_write` en detalle:**
-
-```
-1. entropy_shannon(buf, size)
-   └─ Calcula H ∈ [0, 8] bits/byte.
-      Bytes cifrados → H ≈ 7.8+
-      Texto/imagen → H ≈ 4–6
-
-2. ring_buf_push(ev)
-   └─ Encola evento {EV_WRITE, pid, path, entropy, size, timestamp}
-      para que analyzer_thread lo procese en background.
-
-3. detector_check_write(ctx, pid, path, entropy, size)
-   └─ Evalúa scoring local (ver 4.3) → VERDICT_NORMAL | BLOCK
-
-4. Si BLOCK:
-   ├─ zfs_snapshot_emergency()  → preserva estado pre-ataque
-   ├─ mitigation_kill_process() → SIGKILL al atacante
-   └─ return -EPERM             → la escritura NUNCA llega a disco
-
-5. Si NORMAL:
-   └─ pwrite() → datos persisten en ZFS
-```
-
-### 4.2 entropy.c — Análisis Estadístico de Bytes
-
-**Archivo:** `src/entropy.c` (97 líneas)  
-**Rol:** Caja de herramientas estadísticas para caracterizar buffers de bytes.
-
-**¿Qué problema resuelve?** Necesitamos decidir si un buffer "parece cifrado" o "parece datos normales". Esto no se puede hacer con pattern matching — se necesitan tests estadísticos.
-
-**Funciones:**
-
-| Función | Qué mide | Interpretación |
-|---|---|---|
-| `entropy_shannon(buf, len)` | Entropía de Shannon. Mide la "sorpresa" promedio de cada byte. | **0** = todos los bytes iguales. **8.0** = distribución perfectamente uniforme (cifrado). |
-| `entropy_chi_square(buf, len)` | Test χ² de bondad de ajuste a distribución uniforme. | **Cercano a 0** = muy uniforme → cifrado. **Alto** = distribución sesgada → datos normales. |
-| `entropy_sliding_window(buf, len, block_sz)` | Entropía por bloques de N bytes. | Detecta cifrado parcial (ransomware que solo cifra los primeros KB de cada archivo). |
-| `entropy_autocorrelation(H[], n)` | Correlación de Pearson lag-1 entre entropías consecutivas. | **Baja** = cada bloque es independiente → cifrado. **Alta** = datos con estructura → normal. |
-| `entropy_chi2_from_hist(hist[256], total)` | χ² desde histograma precomputado. | Igual que `entropy_chi_square` pero sobre un histograma ya calculado (usada por tests; el detector acumula χ² por escritura vía `chi2_sum`/`chi2_samples`). |
-
-**¿Por qué estas 5 y no otras?**
-
-- **Shannon + χ²** cubren el 95% de los casos: si la entropía es alta **y** la distribución es uniforme, es cifrado con muy alta probabilidad.
-- **Sliding window** ataca el caso de ransomware "rápido" que cifra solo los primeros N bytes de cada archivo (para no disparar alarmas por volumen).
-- **Autocorrelación** distingue archivos comprimidos (`.zip`, `.jpg`) que tienen alta entropía pero **correlacionada**, del cifrado que tiene entropía alta y **descorrelacionada**.
-- **Chi² from hist** permite evaluar uniformidad sobre una **ventana de tiempo** (muchas escrituras), no sobre un solo buffer.
-
-**Complejidad:** O(n) en todos los casos. Un buffer de 4KB se procesa en < 1μs.
-
-### 4.3 detector.c — Motor de Scoring por Comportamiento
-
-**Archivo:** `src/detector.c` (248 líneas)  
-**Rol:** El cerebro de la operación. Mantiene estado por PID, calcula un score de riesgo agregado, y emite veredictos.
-
-**¿Qué problema resuelve?** La entropía sola no alcanza. Un backup comprimiendo archivos produce alta entropía pero es legítimo. Necesitamos **combinar múltiples señales** y seguirlas en el tiempo **por proceso**.
-
-**Arquitectura interna:**
-
-```
-detector_ctx
-├── pids[] → pid_state_t    (uno por cada PID observado, tope 256,
-│   │                          inactivos >30s se liberan)
-│   ├── Métricas de escritura: write_count, bytes_written
-│   ├── Métricas de entropía: entropy_sum, entropy_max, entropy_samples
-│   ├── Métricas de rename:  rename_count, ext_change_count
-│   ├── χ² por escritura:    chi2_sum, chi2_samples (media por ventana)
-│   ├── Canary:              canary_triggered
-│   ├── Ventana temporal:    window_start_ns, last_event_ns
-│   └── Veredicto actual:    score, verdict, attack_confirmed
-├── lock (pthread_mutex_t)  → thread-safe
-└── Configuración:
-    ├── Pesos: w_entropy=0.35, w_write=0.20, w_rename=0.15,
-    │          w_chi2=0.20, w_unlink=0.10
-    ├── Umbrales: score_thresh=0.65 (BLOCK), warn=0.45 (SUSPICIOUS)
-    └── Parámetros: window_secs, entropy_thresh, write_thresh, rename_thresh
-```
-
-**Ecuación de scoring — 5 señales normalizadas a [0, 1]:**
-
-```
-score = 0.35 · f(entropía media)
-      + 0.20 · f(tasa de escrituras/ventana)
-      + 0.15 · f(tasa de renombrados/ventana)
-      + 0.20 · f(χ² medio de uniformidad)
-      + 0.10 · f(tasa de unlinks/ventana)        ← caza de backups
-```
-
-Cada `f(x)` es una función de normalización que mapea la señal cruda al rango [0, 1]. Por ejemplo, entropía se normaliza como `(H - 5.0) / 3.0` (5.0→0, 8.0→1). El ratio lectura/escritura **no** participa del score síncrono: los `EV_READ` no llegan al detector, se evalúa en el camino async (`analyzer.c` → features ML, `read_write_ratio`).
-
-**¿Por qué estos pesos?**
-
-| Señal | Peso | Justificación |
-|---|---|---|
-| Entropía | 0.35 | Es la señal más fuerte — el cifrado siempre produce alta entropía. |
-| χ² uniformidad | 0.20 | Compresión también tiene alta entropía, pero su distribución NO es perfectamente uniforme. χ² bajo = cifrado real. Sin esta señal, el score máximo de un ataque entropy-only queda en 0.55 (< 0.65) y nunca bloquea. |
-| Tasa escrituras | 0.20 | Ransomware escribe agresivamente; un proceso normal no escribe 500+ veces en 5 segundos. |
-| Renombrados | 0.15 | Cambiar `.docx` → `.locked` es comportamiento clásico de ransomware. |
-| Tasa unlinks | 0.10 | Caza de backups: análogo Linux del `vssadmin delete shadows` de Windows (borrar backups antes/después de cifrar). Sola no bloquea: un `rm -rf` benigno (`make clean`) aporta máximo 0.10 < 0.65. |
-
-**Freno global (anti-evasión multiproceso):** un ransomware que forkea N workers diluye el scoring per-PID (cada worker queda bajo todos los umbrales). El detector agrega en la ventana la tasa de escrituras con **firma de cifrado** (entropía alta **y** χ² uniforme — un `.jpg`/`.zip` comprimido tiene alta entropía pero χ² alto, no cuenta) de todos los PIDs: ≥100 en la ventana arma el freno y los escritores con firma de cifrado reciben `VERDICT_BLOCK` aunque su score individual sea bajo. Un writer benigno de baja entropía nunca es bloqueado por el freno. Lo mismo aplica a renames con cambio de extensión (≥60/ventana). Los eventos de bloqueo se loguean con `"brake":1`.
-
-**Regla rápida adicional:** Si `entropy > umbral` **Y** `write_count > 20` en la misma ventana → `VERDICT_SUSPICIOUS` inmediato. Esto atrapa ransomware agresivo en los primeros 20 archivos, sin esperar a que el score acumulado cruce 0.65.
-
-**Veredictos y acciones:**
-
-| Veredicto | Score | Acción en guardian_fs.c |
-|---|---|---|
-| `VERDICT_NORMAL` (0) | < 0.45 | La escritura pasa a ZFS normalmente. |
-| `VERDICT_SUSPICIOUS` (1) | ≥ 0.45 | La escritura pasa pero se loguea. El analyzer thread intensifica monitoreo. |
-| `VERDICT_BLOCK` (2) | ≥ 0.65 o canary tocado | Bloqueo: snapshot + kill + EPERM. |
-
-**Ventanas temporales:** Cada PID tiene una ventana de N segundos (default 5s). Al expirar, los contadores se resetean. Esto evita que un proceso legítimo acumule "falsos positivos" por escribir mucho a lo largo de horas.
-
-### 4.4 canary.c — Archivos Señuelo
-
-**Archivo:** `src/canary.c` (80 líneas)  
-**Rol:** Despliega archivos falsos con nombres atractivos para que el ransomware los procese. Si un canary es tocado → ataque confirmado.
-
-**¿Qué problema resuelve?** El scoring estadístico tiene falsos positivos potenciales (backups, compresión). Tocar un canary es **evidencia irrefutable** de ransomware — ningún proceso legítimo modifica `A_important_report.docx` y luego `ZZ_backup_keys.txt` en secuencia.
-
-**Estrategia de nombres:**
-
-| Nombre | ¿Por qué? |
-|---|---|
-| `A_important_report.docx` | Prefijo `A_` → primero en orden alfabético. Mayoría del ransomware procesa A→Z. |
-| `A_financials_2025.xlsx` | Contenido financiero falso → muy atractivo para cifrar. |
-| `ZZ_backup_keys.txt` | Prefijo `ZZ_` → último en orden alfabético. Cubre ransomware que procesa Z→A. |
-| `.hidden_canary_01.dat` | Archivo oculto (prefijo `.`) — si el ransomware procesa hidden files, cae. |
-| `resume_final_v3.docx` | Nombre neutral, extensión `.docx` (la más atacada). |
-| `family_photos_2024.jpg` | Simula fotos personales — objetivo de ransomware doméstico. |
-
-**Contenido:** Los archivos contienen ~4 KB de texto plano falso (reportes financieros ficticios) con baja entropía. Esto es deliberado: si un canary tuviera alta entropía, el ransomware podría confundirlo con un archivo ya cifrado y saltearlo.
-
-**Detección en varias capas (con discriminación por intención):**
-- `gfs_open()` — abrir un canary **para escritura** (`O_WRONLY`/`O_RDWR`) → `detector_signal_canary()` arma la señal. Un ransomware abre los canaries para cifrarlos.
-- `gfs_open()` — abrir un canary **read-only** (tar, `cp -r`, rsync, thumbnailers, AV) → `detector_note_canary_read()`: señal leve (+0.05/read, tope +0.15 por ventana), **no arma el kill**. Sin esta discriminación, un `cp -r` dentro del mount que toca un canary moría en su próxima escritura.
-- `gfs_rename()` — renombrar un canary **con cambio de extensión** (`.docx` → `.locked`) → señal fuerte. Moverlo sin cambiar extensión → señal leve (un usuario reorganizando archivos).
-- `gfs_write()` — la señal armada bloquea solo escrituras con **firma de cifrado** (entropía > umbral): un usuario editando el señuelo (texto de baja entropía, autosave, temporales del editor) no es bloqueado; el ransomware que cifra tras tocar el canary, sí.
-- `gfs_unlink()` — si el proceso **elimina** un canary → bloqueo inmediato sin esperar scoring. Los unlinks de archivos normales alimentan la señal de caza de backups (w_unlink en el score).
-
-### 4.5 zfs_snap.c — Recuperación vía Snapshots ZFS
-
-**Archivo:** `src/zfs_snap.c` (96 líneas)  
-**Rol:** Gestión de snapshots ZFS para recuperación post-ataque.
-
-**¿Qué problema resuelve?** Sin snapshots, aunque bloqueemos al ransomware, los archivos que YA cifró están perdidos. ZFS nos da la capacidad de "viajar en el tiempo" al estado pre-ataque.
-
-**¿Por qué ZFS?**
-- **Snapshots instantáneos (O(1))**: ZFS es Copy-on-Write. Un snapshot no copia datos, solo marca metadatos.
-- **Inmutables**: Ni siquiera root puede modificar un snapshot sin `zfs destroy`. El ransomware no puede cifrar retroactivamente.
-- **Rollback instantáneo**: `zfs rollback` es O(1) — solo revierte punteros de metadatos.
-- **Compresión lz4**: Reduce el overhead de almacenamiento de los snapshots.
-
-**Tres funciones, tres momentos:**
-
-| Función | Cuándo se usa | Qué hace |
-|---|---|---|
-| `zfs_snapshot_emergency()` | Primer WARN y cada bloqueo | **Asíncrona** (worker thread): el handler FUSE solo señaliza (µs). Dedup por cooldown de 10s — un ataque sostenido no genera más de uno por cooldown. Etiquetada `@guardian_emergency_<timestamp>`, retiene los últimos 10. |
-| `zfs_snapshot_schedule()` | Hilo background, cada 60s | Snapshots periódicos `@guardian_auto_<timestamp>`. Retiene los últimos 20. |
-| `zfs_rollback_latest()` | Manual (administrador) | Recupera el filesystem al snapshot más reciente con el prefijo dado. |
-
-**Nota de implementación:** Todas las invocaciones de `zfs(8)` van por `posix_spawnp` con argv directo — **sin shell** (`system()`/`popen` interpolaban strings en comandos shell: riesgo de inyección y costo de fork+shell en el hot path). En producción se recomienda `libzfs` directa para mejor manejo de errores y performance.
-
-### 4.6 ring_buffer.c — Buffer Circular Thread-Safe
-
-**Archivo:** `src/ring_buffer.c` (81 líneas)  
-**Rol:** Cola de comunicación entre el hilo principal (FUSE) y el hilo de análisis (analyzer).
-
-**¿Qué problema resuelve?** En `gfs_write`, no podemos hacer análisis pesados (ML) porque la syscall del usuario está bloqueada esperando. La solución es **productor-consumidor**: el hilo FUSE produce eventos y los encola rápido; el hilo analyzer los consume en background sin bloquear al usuario.
-
-**¿Por qué ring buffer y no una cola del SO?**
-- **Latencia mínima**: `memcpy` + incrementar punteros. Sin syscalls.
-- **Thread-safe con mutex + condition variables**: Sin busy-waiting. El productor duerme si está lleno, el consumidor duerme si está vacío.
-- **Tamaño fijo en memoria**: 64K eventos de ~4128 bytes c/u ≈ 256 MB en el peor caso. Controlado.
-
-**API:**
 ```c
-struct ring_buf *ring_buf_create(capacity, elem_size);
-int ring_buf_push(rb, &event);       // bloquea si lleno
-int ring_buf_pop(rb, &event);        // bloquea si vacío
-int ring_buf_try_pop(rb, &event);    // no bloqueante, retorna -1 si vacío
-void ring_buf_destroy(rb);
+// La idea central de gfs_write(), simplificada:
+double ent = entropy_shannon(buf, size);          // 1. medir
+ring_buf_push(evbuf, &evento);                    // 2. anotar para el fondo
+int v = detector_check_write(det, pid, path, ent, size, chi2);  // 3. decidir
+if (v == VERDICT_BLOCK && !modo_sombra) {
+    zfs_snapshot_emergency(dataset);              // 4a. fotografía del disco
+    mitigate_and_log(pid, path);                  //     matar al atacante
+    return -EPERM;                                //     la escritura NO llega al disco
+}
+return pwrite(fd, buf, size, offset);             // 4b. escribir normalmente
 ```
 
-### 4.7 mitigation.c — Terminación del Proceso Atacante
+**Detalle que suele morder:** las operaciones "inofensivas" también importan. `cp` cambia permutos del archivo copiado, `tar` restaura fechas, `mkdir` corrige modos. Si un handler falta, el kernel le contesta "no implementado" a los programas y todo falla dentro del mount (nos pasó: ver la bitácora). Los handlers passthrough tienen que ser completos, y el daemon no debe aplicar su propio umask — el del usuario ya fue aplicado.
 
-**Archivo:** `src/mitigation.c` (14 líneas)  
-**Rol:** Envía `SIGKILL` al PID del proceso que disparó el bloqueo.
+**Modo sombra** (`GUARDIAN_SHADOW_MODE=1`): el detector opina igual y todo se anota en el log, pero no se bloquea, no se mata y no se fotografía. Pensado para observar la realidad sin interferir — y para juntar datos de entrenamiento completos.
 
-**¿Por qué SIGKILL y no SIGTERM?** SIGTERM es "por favor, terminale". El ransomware puede ignorarlo o tener un handler que cifre todo antes de salir. SIGKILL es inapelable — el kernel destruye el proceso inmediatamente sin darle oportunidad de ejecutar más código.
+### `entropy.c` — la calculadora
 
-**¿Por qué matar el proceso?** Bloquear la syscall con `-EPERM` detiene **esa** escritura, pero el ransomware va a reintentar o pasar al siguiente archivo. Matar el proceso corta el ataque de raíz.
+Tres mediciones distintas sobre los bytes de cada escritura:
 
-**Verificación de identidad (anti PID-reuse):** antes del `SIGKILL` se compara el `starttime` actual del PID (campo 22 de `/proc/<pid>/stat`) con el registrado por el detector al crear la entrada. Si difiere, el PID fue reutilizado por otro proceso → el kill se **omite** (`MIT_PID_REUSED`) y el estado envenenado del PID se descarta (`detector_reset_pid`). Esto importa en el camino async: un veredicto ML "attack" llega hasta 5s después de los eventos — si el atacante murió y su PID fue reutilizado en esa ventana, sin esta verificación mataríamos a un inocente. El resultado del kill va al log estructurado (`process_killed` / `kill_skipped`).
-
-### 4.8 analyzer.c — Hilo de Análisis Asíncrono
-
-**Archivo:** `src/analyzer.c` (245 líneas)  
-**Rol:** Hilo background que consume el ring buffer, acumula estadísticas por PID y consulta al servidor ML.
-
-**Estado actual:** Implementación completa con las siguientes capacidades:
-1. Consume eventos del ring buffer vía `ring_buf_try_pop()` (no bloqueante).
-2. Acumula estadísticas por PID en `pid_table` (128 slots max): write_count, total_bytes, entropy_sum, entropy_max, rename_count, unlink_count.
-3. Ventanas temporales de 5 segundos (`ML_WINDOW_SECS`) con rotación automática.
-4. Conecta al servidor ML (`/tmp/guardian_ml.sock`) al iniciar.
-5. Si la conexión falla, reintenta cada 5 segundos mientras no haya eventos.
-6. Cuando la ventana expira y hay suficientes escrituras (>=10), construye un feature vector de 14 dimensiones y lo envía al ML server.
-7. Si el ML server responde con veredicto "attack", llama a `detector_confirm_attack()` — las siguientes write/rename de ese PID reciben `VERDICT_BLOCK` (el camino async tiene poder de enforcement real).
-8. Si el ML server no está disponible, solo rota ventanas sin enviar features (detección estadística pura).
-
-**Features enviadas al ML server (14/14 calculadas):**
-- `entropy_mean`, `entropy_max`, `entropy_std`, `entropy_autocorr` (Pearson lag-1 sobre las últimas 32 entropías por PID, vía `entropy.c`)
-- `write_rate`, `bytes_written_rate`, `rename_rate`, `unlink_rate`
-- `read_write_ratio` (eventos `EV_READ` / `EV_WRITE`)
-- `chi2_stat` (promedio del χ² por write; solo writes ≥ 256 bytes — `entropy_chi_square()` devuelve 1e9 como sentinel para muestras menores, se filtra)
-- `ext_change_rate` (renames con cambio de extensión / renames totales, vía `ev.ext_changed`)
-- `canary_accessed` (eventos `EV_CANARY`: apertura o borrado de archivo canary)
-- `unique_dirs`, `file_type_variety` (sets de hashes FNV-1a de directorios y extensiones, tope 16 distintos por ventana)
-
-**Nota:** El flush es time-driven (`flush_expired_windows()` corre cada ≤50ms), por lo que las ventanas de procesos ya matados por la mitigación también se registran. Ver `docs/pending.md` para lo pendiente.
-
-**¿Por qué un hilo separado?** La inferencia ML (aunque sea vía socket local) tiene latencia de 1–5ms. No podemos bloquear la syscall del usuario ese tiempo. El analyzer opera en background: la detección rápida (detector.c) frena el ataque inmediato; el ML da una segunda opinión para refinar.
-
----
-
-## 5. Flujo de Datos — El Camino Completo
-
-### 5.1 Ataque de ransomware cifrador (happy path de detección)
-
-```
-Momento T0: Ransomware ejecuta write("documento.docx", bytes_cifrados, 4096)
-
-T0 + 0μs:  FUSE redirige a gfs_write()
-T0 + 1μs:  entropy_shannon(bytes_cifrados, 4096) → 7.94 bits/byte
-T0 + 2μs:  ring_buf_push(ev) → evento encolado para analyzer
-T0 + 3μs:  detector_check_write(pid=1234, path="...docx", entropy=7.94, size=4096)
-              ├─ get_or_create_pid(1234)
-              ├─ maybe_rotate_window() → ventana aún vigente (2s transcurridos de 5s)
-              ├─ write_count: 18 → 19, entropy_samples++
-              ├─ compute_score():
-              │    f_entropy = (7.94-5.0)/3.0 = 0.98
-              │    f_write   = 19/500 = 0.038
-              │    score = 0.40·0.98 + 0.20·0.038 = 0.40
-              ├─ score(0.40) < 0.45 → VERDICT_NORMAL
-              └─ return VERDICT_NORMAL
-T0 + 4μs:  pwrite(fd, bytes_cifrados, 4096) → disco ZFS
-
-... (19 escrituras más, score subiendo) ...
-
-Momento T0+800ms: Write #39 — score cruza 0.65
-
-T0+800ms + 3μs: detector_check_write() → score = 0.72 ≥ 0.65
-                   → VERDICT_BLOCK
-T0+800ms + 4μs: zfs_snapshot_emergency("tank/data")
-                   → "zfs snapshot tank/data@guardian_emergency_20260627T143022Z"
-T0+800ms + 5μs: mitigation_kill_process(1234)
-                   → kill(1234, SIGKILL)
-T0+800ms + 6μs: return -EPERM
-                   → El ransomware ve "Permission denied"
-                   → Los archivos escritos antes del bloqueo están en ZFS
-                   → El snapshot de emergencia preserva el estado pre-ataque
-                   → Rollback manual: zfs rollback tank/data@guardian_emergency_...
-```
-
-### 5.2 Escritura legítima (no bloquea)
-
-```
-Aplicación escribe reporte_q4.pdf (bytes de PDF, H ≈ 5.2)
-
-gfs_write() → entropy = 5.2 → score ≈ 0.12 → VERDICT_NORMAL → pwrite() OK
-```
-
-### 5.3 Canary tocado (bloqueo inmediato)
-
-```
-Ransomware abre A_important_report.docx → gfs_open()
-  → canary_is_canary() → TRUE
-  → detector_signal_canary() → score += 0.8 → score ≥ 1.0
-  → siguiente write() del mismo PID → VERDICT_BLOCK inmediato
-```
-
----
-
-## 6. Build, Test y Deploy
-
-### Compilación
-
-```bash
-# Requisitos: gcc (C17), cmake 3.22+, libfuse3-dev
-sudo bash scripts/install_deps.sh
-cmake -S . -B build && cmake --build build --parallel
-```
-
-**Opciones de compilación:** `-std=c17 -Wall -Wextra -Wpedantic` — cero warnings.
-
-### Tests unitarios
-
-```bash
-# Todos los tests (28 tests, 83 assertions)
-bash scripts/run_tests.sh
-
-# Individual
-gcc -std=c17 tests/unit/test_entropy.c src/entropy.c -Iinclude -lm -o /tmp/t && /tmp/t
-```
-
-**Cobertura:** 5/8 módulos con tests dedicados. Los módulos sin tests directos (zfs_snap, analyzer, guardian_fs) requieren ZFS real para testearse — planeados como integration tests.
-
-### Deploy en VM
-
-```bash
-# 1. Pool ZFS para testing (2 GB file-backed)
-sudo bash scripts/zfs_setup.sh
-
-# 2. Montar el proxy FUSE
-sudo bash scripts/mount.sh /mnt/guardian_real /mnt/protected
-
-# 3. Probar — cualquier escritura con alta entropía dispara el detector
-```
-
----
-
-## 7. Decisiones de Diseño y Trade-offs
-
-| Decisión | Alternativa considerada | Por qué esta |
+| Función | Mide | Intuición |
 |---|---|---|
-| **FUSE userspace** | Módulo de kernel Linux | Seguridad (un bug no paniquea), velocidad de desarrollo, integración con Python. |
-| **ZFS** | btrfs, LVM snapshots | Snapshots atómicos CoW, inmutables, compresión lz4, rollback O(1). |
-| **Scoring ponderado** | Árbol de decisión, reglas fijas | Pesos calibrables sin recompilar ML, interpretable, cada señal independiente. |
-| **C17 para detección** | Python para todo | Latencia < 1ms en la syscall. Python tarda > 1ms solo en iniciar el intérprete. |
-| **Ring buffer propio** | Colas POSIX (mq), pipes | Sin syscalls en el productor. Control total de memoria y bloqueo. |
-| **system() para ZFS** | libzfs | Simplicidad para PoC. libzfs requiere linkear contra bibliotecas no estándar de OpenZFS. |
-| **Ventanas por PID** | Scoring global | Un atacante no debe "esconderse" detrás de la actividad de otros procesos. |
-| **Pesos actuales** | ML desde el principio | La PoC necesita funcionar sin datos de entrenamiento. Los pesos se calibraron con razonamiento de dominio y se pueden refinar con ML. |
+| `entropy_shannon` | Qué tan "revueltos" están los bytes (0 = todos iguales, 8 = ruido perfecto) | El medidor principal |
+| `entropy_chi_square` | Si los 256 valores posibles de byte aparecen en cantidades parejas | Segunda opinión: un `.jpg` está revuelto pero con estructura; el cifrado está revuelto **y parejo** |
+| `entropy_autocorrelation` | Si una escritura se parece a la anterior | El comprimido repite patrones; el cifrado no |
 
----
+La combinación **revuelto + parejo + sin parecido entre bloques** es la firma del cifrado, y es lo que el freno global del detector exige antes de bloquear por multitud (ver abajo).
 
-## 8. Trabajo Pendiente
+### `detector.c` — el guardia
 
-Ver `docs/architecture/README.md` sección 7.2 para la lista completa priorizada. Resumen rápido:
+Mantiene una ficha por cada programa (PID) con su actividad de los últimos 5 segundos, y calcula un puntaje:
 
-| Prioridad | Tarea | Esfuerzo |
+```
+puntaje = 0.35·entropía + 0.20·velocidad de escritura + 0.15·renombrados
+        + 0.20·uniformidad(χ²) + 0.10·borrados
+```
+
+| Puntaje | Veredicto | Qué pasa |
 |---|---|---|
-| 🔴 Alta | Leer config dinámica en vez de paths hardcodeados | 30 min |
-| 🔴 Alta | Shutdown graceful (SIGTERM/SIGINT) | 20 min |
-| 🟡 Media | Integration test (simular ransomware) | 1–2 h |
-| 🟡 Media | Completar features parciales en `analyzer.c` (std, autocorr, chi2, etc.) | 2 h |
-| 🟡 Media | Generar dataset CSV etiquetado para entrenamiento ML | 2–3 h |
-| 🟢 Baja | Liberar slots de `pid_table` cuando mueren procesos | 30 min |
-| 🟢 Baja | Systemd unit file | 15 min |
+| < 0.45 | NORMAL | La escritura pasa |
+| ≥ 0.45 | SOSPECHOSO | Pasa, pero se anota y se toma un snapshot temprano (por si acaso) |
+| ≥ 0.65 | BLOQUEAR | Snapshot de emergencia + kill + la escritura no llega al disco |
+
+Encima del puntaje hay tres reglas de oro que no negocian:
+
+1. **Señuelo + cifrado = ataque confirmado.** Tocar un archivo trampa para escribir y después escribir datos con firma de cifrado bloquea al instante. (Pero editar el señuelo con texto normal, o *leerlo* como hace un backup, no: la trampa discrimina la intención.)
+2. **Freno global.** Un ransomware moderno reparte el trabajo entre varios procesos para que cada uno quede bajo los umbrales. El detector también suma *en total* las escrituras con firma de cifrado de todos los procesos: si en la ventana hay 100+ (o 60+ renombrados con cambio de extensión), se arma el freno y se bloquea a los escritores con firma de cifrado — aunque su puntaje individual sea bajo. Un escritor benigno de baja entropía jamás es bloqueado por el freno.
+3. **Confirmación externa.** El camino de fondo (ML) puede marcar a un programa como ataque confirmado; su próxima operación se bloquea.
+
+Las fichas expiran: los programas inactivos más de 30 segundos liberan su lugar (la tabla es de tamaño fijo). Y antes de matar a alguien se verifica la identidad: si el PID original ya murió y el sistema recicló su número para un programa inocente, **no se lo mata** (el veredicto llegó tarde; el inocente no tiene la culpa).
+
+### `canary.c` — la trampa
+
+Despliega archivos falsos con nombres diseñados para que un ransomware que recorre el disco en orden alfabético los encuentre primero (`A_important_report.docx`) y último (`ZZ_backup_keys.txt`), más uno oculto y otros con extensiones codiciadas. El contenido es texto plausible y *de baja entropía* a propósito: si parecieran "ya cifrados", un ransomware inteligente los saltearía.
+
+### `ring_buffer.c` — la cola
+
+Comunicación entre el hilo que atiende operaciones de archivo (productor) y el analista de fondo (consumidor), sin llamadas al sistema: un arreglo circular con lock. El productor nunca se bloquea ocupándose de métricas caras.
+
+### `analyzer.c` — el analista de fondo
+
+Consume la cola y arma, por programa, ventanas de 5 segundos. Cuando una ventana vence con al menos 10 escrituras, calcula las **14 señales** (ver la [guía de ML](ml-architecture.md)) y se las manda al servidor Python por un socket local. Con menos de 10 escrituras, la ventana se descarta (no alcanza para un resumen estadístico serio).
+
+**Regla aprendida por las malas:** si el envío falla (server caído, reinicio del intermediario), la ventana se **guarda y se reintenta** cuando la conexión vuelva — antes se descartaba y perdíamos justamente las ventanas de los atacantes recién matados. Con un tope de 30 s de retención para no llenar la tabla si el server no vuelve nunca.
+
+### `mitigation.c` — el martillazo
+
+`kill(pid, SIGKILL)`. SIGKILL y no SIGTERM porque el ransomware podría tener un manejador de "al recibir SIGTERM, cifrar todo lo que falta antes de morir". SIGKILL no se puede interceptar: el kernel destruye el proceso en el acto.
+
+### `zfs_snap.c` — la máquina del tiempo
+
+Tres momentos, tres funciones:
+
+| Función | Cuándo | Qué |
+|---|---|---|
+| `zfs_snapshot_schedule` | Hilo de fondo, cada 60 s | Fotografía de rutina (`guardian_auto_*`, retiene las últimas 20) |
+| `zfs_snapshot_emergency` | Primera sospecha y cada bloqueo | Fotografía del estado pre-daño (`guardian_emergency_*`, retiene 10). **Asíncrona**: el handler de escritura solo deja señalada la orden; ejecutar `zfs` cuesta decenas de milisegundos que el usuario no puede pagar dentro de su guardado |
+| `zfs_rollback_latest` | Manual (`scripts/rollback.sh`) | Vuelve el disco a la foto más reciente |
+
+Todas las llamadas a la herramienta `zfs` se hacen con `posix_spawnp` (sin shell de por medio: ni inyección de comandos ni el costo de levantar un shell en cada snapshot).
 
 ---
 
-*Documento generado para acompañar la defensa del Proyecto Final. Cualquier duda técnica, consultar `docs/architecture/README.md` y `docs/testing-guide.md`.*
+## 4. Los programas Python
+
+| Archivo | Rol | Detalle |
+|---|---|---|
+| `src/ml_server.py` | Escucha el socket `/tmp/guardian_ml.sock`, corre el ensemble (Random Forest + XGBoost + Isolation Forest) y contesta con probabilidad de ataque + veredicto | Si no hay modelos entrenados, cae a reglas estadísticas simples y *sigue contestando*; importa las bibliotecas pesadas solo si hay modelos (un server sin modelos gasta 30 MB, no 130) |
+| `src/train_model.py` | Lee `data/training_data.csv`, evalúa con separación por sesiones, entrena y guarda en `/var/lib/guardian/models/` | Entrena con la MISMA clase que sirve las predicciones: lo evaluado es lo desplegado |
+| `scripts/ml_proxy.py` | Se interpone entre el analyzer y el server, y anota cada ventana que pasa en el CSV con su etiqueta | Sin él no hay dataset: es la "máquina de anotar" |
+
+La comunicación C ↔ Python es JSON en líneas, sobre socket local: `{pid, features{...}}` hacia un lado, `{p_attack, verdict, scores}` hacia el otro. Un detalle crítico: el lado C parsea la respuesta buscando exactamente `"verdict":"attack"` (sin espacios) — si el lado Python cambia el formato de serialización, el veredicto deja de matchear silenciosamente y todo se lee como "normal". Cambiar el formato de un lado exige cambiarlo del otro.
+
+---
+
+## 5. Compilar, probar, correr
+
+```bash
+# Deps del sistema (una vez)
+sudo ./scripts/install_deps.sh
+
+# Compilar (C17, sin warnings con -Wall -Wextra)
+cmake -DCMAKE_BUILD_TYPE=Release -S . -B build
+cmake --build build --parallel
+
+# Tests (61, ver docs/tests.md)
+./scripts/run_tests.sh
+
+# Disco de pruebas ZFS + montar (ver README paso a paso)
+sudo ./scripts/zfs_setup.sh
+sudo ./scripts/mount.sh /mnt/guardian_real /mnt/protected tank/data
+
+# Circuito ML completo de punta a punta (compila, monta, simula, verifica)
+./scripts/test_ml_pipeline.sh 1 0
+```
+
+**Gotchas de build/tests que conviene saber antes de romperse la cabeza:**
+
+- `analyzer.c` se compila **aparte** de la librería de objetos: referencia dos globales (`evbuf`, `detector`) que define `guardian_fs.c`; `tests/test_analyzer.c` trae sus propios stubs e incluye el `.c` directamente para llegar a sus funciones internas.
+- El binario **no lee** `configs/guardian.conf` (es referencia): se configura por variables de entorno (`GUARDIAN_REAL_ROOT`, `GUARDIAN_ZFS_DATASET`, `GUARDIAN_LOG_PATH`, `GUARDIAN_SHADOW_MODE`) y los umbrales están como constantes en `src/guardian_fs.c`.
+- En `mitigation` y sus tests, jamás usar PIDs que queden negativos al castear: eso ordenaría matar a *todos* los procesos del sistema.
+- `mount.sh` hace `exec` en foreground: para dejarlo corriendo, lanzarlo con `setsid`/`&`, o desde un systemd unit (pendiente).
+- Los CSVs de datos, los modelos entrenados y los logs están gitignoreados — no commitearlos.
+
+---
+
+## 6. Decisiones de diseño (y sus alternativas)
+
+| Decisión | Alternativa descartada | Por qué |
+|---|---|---|
+| FUSE (userspace) | Módulo de kernel | Un bug nuestro no paniquea el kernel; se debuggea como cualquier programa; y conectar Python por un socket es trivial. El costo (~2 µs por operación) es despreciable contra la latencia del disco |
+| Detección en C, ML aparte | Todo en Python | El camino crítico mide en microsegundos; arrancar el intérprete de Python ya cuesta más que todo el presupuesto |
+| ZFS | btrfs / LVM | Snapshots instantáneos e inmutables (ni root ni el ransomware puede modificar una foto del pasado), rollback en O(1) |
+| Señuelos con discriminación de intención | Señuelo tocado = bloquear | Sin discriminar, un `cp -r` o un backup que *lee* los señuelos moriría injustamente |
+| Ventanas por programa | Puntaje global del sistema | Un atacante no debe poder esconderse detrás de la actividad de programas honestos (por eso el freno global solo bloquea escritores con firma de cifrado) |
+| Pasamanos FUSE completo (todas las operaciones) | Solo las "de interés" | Las herramientas cotidianas usan operaciones "inofensivas" (chmod, utimens…) de formas sorprendentes; si falta una, fallan dentro del mount |
+| Descartar ventanas de <10 escrituras | Enviar todo | Menos de 10 escrituras no alcanzan para un resumen estadístico decente; enviar ruido degrada la señal |
+
+---
+
+## 7. Qué sigue (pendientes vivos)
+
+La lista completa y actualizada vive en [`docs/pending.md`](pending.md). Los destacados de hoy:
+
+- [ ] Leer el archivo de configuración en vez de variables de entorno
+- [ ] Apagado ordenado (hoy no hay handler de SIGTERM/SIGINT)
+- [ ] Freno global con umbral por usuario (hoy es global: en un sistema multiusuario, la actividad de uno puede frenar al otro)
+- [ ] Falso positivo residual del detector rápido con `rsync` masivo dentro del mount (los renombrados de sus archivos temporales disparan la regla) — decisión de diseño pendiente
+- [ ] Verificación empírica del bypass por `mmap` (escribir por memoria mapeada en vez de `write()`)

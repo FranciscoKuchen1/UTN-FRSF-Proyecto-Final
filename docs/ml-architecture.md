@@ -1,611 +1,156 @@
-# Guardian FS — Arquitectura de Machine Learning
+# El machine learning de Guardian FS, explicado sin jerga
 
-> Guía para el Científico de Datos / ML Engineer  
-> Proyecto Final UTN FRSF 2026  
-> Versión: v0.2.0-dev | Junio 2026
+> Esta guía explica **qué hace el ML acá, por qué existe, y cómo se lo usa**. Si buscás los números y hallazgos de la última sesión de entrenamiento, andá a [`docs/cambios-2026-11-04.md`](cambios-2026-11-04.md). Si buscás el flujo con diagramas, a [`docs/pipeline.md`](pipeline.md).
 
 ---
 
-## Índice
+## 1. ¿Para qué hace falta ML si ya hay un detector?
 
-1. [¿Por qué Machine Learning?](#1-por-qué-machine-learning)
-2. [Arquitectura del Pipeline ML](#2-arquitectura-del-pipeline-ml)
-3. [Feature Engineering — El Vector de 14 Señales](#3-feature-engineering--el-vector-de-14-señales)
-4. [Ensemble de Modelos](#4-ensemble-de-modelos)
-   - [4.1 Random Forest (peso 0.35)](#41-random-forest-peso-035)
-   - [4.2 XGBoost (peso 0.30)](#42-xgboost-peso-030)
-   - [4.3 Isolation Forest (peso 0.20)](#43-isolation-forest-peso-020)
-   - [4.4 LSTM (peso 0.15)](#44-lstm-peso-015)
-   - [4.5 ¿Por qué ensemble y no un solo modelo?](#45-por-qué-ensemble-y-no-un-solo-modelo)
-5. [Pipeline de Entrenamiento](#5-pipeline-de-entrenamiento)
-6. [Especificación del Dataset](#6-especificación-del-dataset)
-7. [Protocolo de Integración C ↔ Python](#7-protocolo-de-integración-c--python)
-8. [Fallback y Degradación Graceful](#8-fallback-y-degradación-graceful)
-9. [Estrategia de Evaluación](#9-estrategia-de-evaluación)
-10. [Caminos de Optimización](#10-caminos-de-optimización)
+El detector rápido (el código C que corre en cada escritura) usa **reglas fijas**: "si la entropía supera 7.2 y hay más de 20 escrituras, sospechar". Funciona muy bien contra ransomware agresivo. Pero las reglas fijas tienen dos problemas:
 
----
+1. **Se les puede pasar por debajo.** Un ransomware paciente puede escribir con entropía 7.1, o dormirse entre archivos, y quedar siempre un escalón por debajo de cada umbral.
+2. **Molestan a gente de buena fe.** Comprimir archivos, compilar código o guardar fotos también produce datos "muy revueltos". Una regla simple no distingue un backup de un ataque; un modelo que vio miles de ejemplos de ambos, sí.
 
-## 1. ¿Por qué Machine Learning?
+Entonces la división del trabajo es:
 
-El detector estadístico (`detector.c`) usa umbrales fijos calibrados con razonamiento de dominio: "si la entropía pasa de 7.2 Y hay más de 20 escrituras → sospechoso". Esto funciona para ransomware **conocido y agresivo**, pero tiene limitaciones:
-
-| Limitación del detector estadístico | Cómo el ML lo resuelve |
-|---|---|
-| **Umbrales fijos** — el ransomware puede operar justo debajo (entropía 7.1, 19 escrituras) | El ML aprende combinaciones no lineales de features; no depende de umbrales discretos. |
-| **Falsos positivos con backups/compresión** — tar, gzip, rsync generan alta entropía pero son legítimos | El ML ve el **contexto**: ratio R/W, correlación temporal, velocidad de cambio de extensión. |
-| **Ransomware nuevo (zero-day)** — patrón de ataque nunca visto en reglas | Isolation Forest detecta anomalías sin necesidad de ejemplos de ataque en entrenamiento. |
-| **Evolución temporal** — el ransomware moderno duerme entre archivos para no disparar tasa | LSTM captura patrones secuenciales: "escribió mucho → durmió 2s → escribió más". |
-| **Falsos negativos** — ransomware que cifra parcialmente o solo metadatos | El ML combina 14 señales; aunque una falle, las otras 13 compensan. |
-
-**Estrategia:** El detector C es la **primera línea** — rápida, determinista, sin dependencias externas. El ML es la **segunda opinión asíncrona** — más lenta pero más precisa, ejecutándose en un hilo separado sin bloquear al usuario.
-
----
-
-## 2. Arquitectura del Pipeline ML
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    OFFLINE (entrenamiento)                │
-│                                                          │
-│  Dataset etiquetado (CSV)                                │
-│       │                                                  │
-│       ▼                                                  │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │              train_model.py                       │   │
-│  │  (misma clase que sirve inferencia:               │   │
-│  │   RansomwareDetector de ml_server.py)             │   │
-│  │                                                   │   │
-│  │  1. StratifiedGroupKFold por sesión (sin SMOTE)   │   │
-│  │  2. StandardScaler DENTRO del Pipeline del CV    │   │
-│  │  3. Entrenar (class_weight/scale_pos_weight):     │   │
-│  │     ├─ RandomForest (n=200, depth=15)             │   │
-│  │     ├─ XGBoost (n=200, depth=8)                  │   │
-│  │     └─ IsolationForest (solo clase benigna)      │   │
-│  │  4. Serializar: scaler.pkl, rf.pkl,               │   │
-│  │     iso_forest.pkl, xgb.json                      │   │
-│  └──────────────────────────────────────────────────┘   │
-│                                                          │
-│  LSTM (si se usa):                                       │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  Secuencias de 10 ventanas por PID                │   │
-│  │  → PyTorch LSTM (hidden=64, layers=2)             │   │
-│  │  → Serializar: lstm.pt                            │   │
-│  └──────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────┐
-│                    ONLINE (inferencia)                    │
-│                                                          │
-│  analyzer.c (C, hilo background)                         │
-│       │                                                  │
-│       │ Cada ~1s:                                        │
-│       │  1. Acumula eventos del ring buffer por PID      │
-│       │  2. Calcula feature vector (14 dimensiones)      │
-│       │  3. Conecta a /tmp/guardian_ml.sock              │
-│       │  4. Envía JSON → recibe JSON                     │
-│       ▼                                                  │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │              ml_server.py (Python 3.11+)           │   │
-│  │                                                   │   │
-│  │  Cargar modelos: scaler, rf, xgb, iso, lstm       │   │
-│  │                                                   │   │
-│  │  Por cada request:                                 │   │
-│  │    ├─ StandardScaler.transform(features)           │   │
-│  │    ├─ RF.predict_proba()        → p_rf            │   │
-│  │    ├─ XGB.predict_proba()       → p_xgb           │   │
-│  │    ├─ ISO.predict()             → anomaly_score   │   │
-│  │    ├─ LSTM.forward(sequence)    → p_lstm          │   │
-│  │    │                                              │   │
-│  │    └─ Ensemble voting:                             │   │
-│  │       p_attack = 0.35·p_rf + 0.30·p_xgb           │   │
-│  │                + 0.20·iso_score + 0.15·p_lstm      │   │
-│  │                                                   │   │
-│  │    Response: {"p_attack": 0.89,                    │   │
-│  │               "verdict": "attack",                 │   │
-│  │               "scores": {"rf": 0.92, ...}}         │   │
-│  └──────────────────────────────────────────────────┘   │
-│       │                                                  │
-│       ▼                                                  │
-│  analyzer.c recibe veredicto:                             │
-│    Si p_attack ≥ 0.75 → modificar score en detector.c    │
-│    Si p_attack ≥ 0.50 → intensificar monitoreo del PID   │
-│    Si p_attack < 0.50 → descartar                        │
-└─────────────────────────────────────────────────────────┘
-```
-
----
-
-## 3. Feature Engineering — El Vector de 14 Señales
-
-Cada feature fue elegida para capturar un aspecto específico del comportamiento de ransomware. No son arbitrarias — cada una ataca un vector de evasión conocido.
-
-### Grupo A: Entropía (4 features)
-
-Estas features miden las propiedades estadísticas de los bytes escritos.
-
-| # | Feature | Fórmula | Qué captura |
-|---|---|---|---|
-| 1 | `entropy_mean` | `Σ H_i / n` | Entropía promedio en la ventana. El cifrado produce H > 7.5 consistente. |
-| 2 | `entropy_max` | `max(H_i)` | ¿El proceso **alguna vez** escribió datos de muy alta entropía? Un pico aislado de 7.9 ya es sospechoso. |
-| 3 | `entropy_std` | `std(H_i)` | La **variabilidad** de la entropía. Datos normales varían (texto=4.5, imagen=7.2); el cifrado es monótono (std ≈ 0.1). |
-| 4 | `entropy_autocorr` | Pearson lag-1 de `H[]` | ¿La entropía de escrituras consecutivas está correlacionada? En archivos comprimidos SÍ (estructura); en cifrado NO (ruido blanco). |
-
-**Por qué 4 features de entropía y no solo 1:** La entropía media sola no distingue un `.zip` (H=7.5, std=0.5, autocorr=0.7) de datos cifrados (H=7.8, std=0.05, autocorr=0.1). Las 4 juntas sí.
-
-### Grupo B: Tasas de operación (4 features)
-
-| # | Feature | Fórmula | Qué captura |
-|---|---|---|---|
-| 5 | `write_rate` | `write_count / window_secs` | Escrituras por segundo. Ransomware agresivo: > 100 writes/s. Backup legítimo: similar pero con otras features distintas. |
-| 6 | `bytes_written_rate` | `bytes_written / window_secs` | Throughput real. Ransomware suele escribir en bloques de 4KB–64KB. |
-| 7 | `rename_rate` | `rename_count / window_secs` | Renombrados por segundo. Ransomware renombra CADA archivo después de cifrarlo. |
-| 8 | `unlink_rate` | `unlink_count / window_secs` | Eliminaciones por segundo. Algunos ransomware borran el original después de cifrar. |
-
-### Grupo C: Comportamiento (4 features)
-
-| # | Feature | Fórmula | Qué captura |
-|---|---|---|---|
-| 9 | `read_write_ratio` | `bytes_read / bytes_written` | Ratio lectura/escritura. El ransomware lee un archivo, lo cifra en memoria, y escribe la versión cifrada → ratio ≈ 1.0. Un backup SOLO lee (ratio >> 1). Un generador de datos SOLO escribe (ratio ≈ 0). |
-| 10 | `chi2_stat` | promedio `χ²(buf)` por write ≥ 256B | Test de uniformidad por escritura. χ² < 300 con 255 g.l. → distribución uniforme → cifrado real; texto/ELF estructurado → χ² muy alto. Writes < 256B se excluyen (muestra insuficiente). |
-| 11 | `ext_change_rate` | `ext_changes / rename_count` | Proporción de renombrados que cambian la extensión (`.docx` → `.locked`). Comportamiento casi exclusivo de ransomware. |
-| 12 | `canary_accessed` | `0 \| 1` | Booleano: ¿el proceso tocó un archivo canary? Feature de altísimo poder discriminante. |
-
-### Grupo D: Diversidad (2 features)
-
-| # | Feature | Fórmula | Qué captura |
-|---|---|---|---|
-| 13 | `unique_dirs` | `count(distinct dirname(path))` | ¿Cuántos directorios distintos tocó el proceso? El ransomware recorre recursivamente → muchos directorios. Un proceso normal suele operar en 1–3 directorios. |
-| 14 | `file_type_variety` | `count(distinct extension(path))` | Variedad de extensiones escritas. El ransomware cifra `.docx`, `.pdf`, `.jpg`, `.xlsx` — mucha variedad. Un editor de texto solo toca `.txt` o `.md`. |
-
-### Normalización
-
-Todas las features numéricas se pasan por `StandardScaler` (z-score) antes de entrar a los modelos. Esto es crítico porque las escalas son muy diferentes: `write_rate` puede ser 0–500, `entropy_mean` es 0–8, `chi2_stat` es 0–100000.
-
----
-
-## 4. Ensemble de Modelos
-
-### 4.1 Random Forest (peso 0.35)
-
-**¿Por qué Random Forest?**
-- **Robusto a overfitting** — promedia cientos de árboles, cada uno entrenado con bootstrap + features aleatorias.
-- **Interpretable** — `feature_importances_` nos dice exactamente qué features están contribuyendo más. Esto es oro para ajustar el detector C.
-- **Maneja no-linealidades** — la combinación `entropy alta + write_rate bajo + rename_rate alto` no es una relación lineal, y RF la captura naturalmente.
-- **Bueno con datos tabulares** — no requiere arquitectura especial como las imágenes o el texto.
-
-**Hiperparámetros propuestos:**
-```python
-RandomForestClassifier(
-    n_estimators=200,       # árboles en el bosque
-    max_depth=15,           # profundidad máxima (evita overfitting)
-    min_samples_split=5,    # mínimo para dividir un nodo
-    class_weight='balanced',# compensa desbalance benigno >> ataque
-    random_state=42
-)
-```
-
-**Peso en el ensemble: 0.35** — el más alto porque RF es el modelo más robusto y confiable para este tipo de problema.
-
-### 4.2 XGBoost (peso 0.30)
-
-**¿Por qué XGBoost?**
-- **Gradient boosting** — construye árboles secuencialmente, cada uno corrigiendo los errores del anterior.
-- **Excelente con desbalance de clases** — `scale_pos_weight` ajusta la función de pérdida para penalizar más los falsos negativos. En nuestro caso, un falso negativo (ataque no detectado) es mucho peor que un falso positivo.
-- **Regularización incorporada** — L1 y L2 reducen overfitting mejor que RF solo.
-- **Complementa a RF** — RF y XGBoost tienden a cometer errores en ejemplos diferentes; combinados se corrigen mutuamente.
-
-**Hiperparámetros propuestos:**
-```python
-XGBClassifier(
-    n_estimators=200,
-    max_depth=8,                # más bajo que RF (boosting necesita árboles débiles)
-    learning_rate=0.05,         # paso pequeño, muchos árboles
-    scale_pos_weight=10,        # penalizar 10x más los falsos negativos
-    subsample=0.8,              # 80% de datos por árbol
-    colsample_bytree=0.8,       # 80% de features por árbol
-    random_state=42
-)
-```
-
-### 4.3 Isolation Forest (peso 0.20)
-
-**¿Por qué Isolation Forest?**
-- **NO supervisado** — se entrena SOLO con datos benignos. No necesita ejemplos de ataque.
-- **Detecta zero-days** — cualquier comportamiento suficientemente distinto a "normal" es una anomalía, aunque el modelo nunca haya visto ese patrón de ataque específico.
-- **Fundamento teórico sólido** — las anomalías son "pocas y diferentes"; se aíslan con pocas particiones aleatorias.
-
-**¿Cómo funciona?** Isolation Forest construye árboles de decisión aleatorios. Un punto normal requiere muchas particiones para ser aislado (está rodeado de otros puntos). Una anomalía requiere pocas particiones (está aislada). El promedio de profundidad de aislamiento es el anomaly score.
-
-**Hiperparámetros propuestos:**
-```python
-IsolationForest(
-    n_estimators=100,
-    contamination=0.01,     # asumimos ~1% de anomalías en producción
-    max_samples=256,        # submuestreo (más rápido, igual de efectivo)
-    random_state=42
-)
-```
-
-**Peso en el ensemble: 0.20** — menor que RF y XGB porque es no supervisado y por lo tanto menos preciso en la frontera de decisión fina. Pero es invaluable para detectar ataques nunca vistos.
-
-### 4.4 LSTM (peso 0.15)
-
-**¿Por qué LSTM?**
-- **Captura patrones temporales** — el comportamiento de ransomware evoluciona en el tiempo: fase de enumeración → fase de cifrado → fase de renombrado.
-- **Memoria de largo plazo** — un LSTM puede recordar que "hace 8 ventanas este PID hizo enumeración agresiva, luego durmió 2s, y ahora está escribiendo con alta entropía".
-- **El ransomware moderno usa tácticas temporales** — sleeps entre archivos, cifrado en ráfagas, pausas para evadir detección por tasa.
-
-**Arquitectura propuesta:**
-```python
-class RansomwareLSTM(nn.Module):
-    def __init__(self, input_dim=14, hidden_dim=64, num_layers=2):
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):  # x: (batch, seq_len=10, features=14)
-        out, (hn, cn) = self.lstm(x)
-        return self.sigmoid(self.fc(out[:, -1, :]))
-```
-
-**Input:** Secuencia de 10 ventanas consecutivas para el mismo PID. Cada ventana es un vector de 14 features.  
-**Output:** Probabilidad de ataque.
-
-**Peso en el ensemble: 0.15** — el más bajo porque:
-- Requiere más datos de entrenamiento (secuencias, no puntos individuales).
-- Es más costoso computacionalmente.
-- Solo se activa cuando hay suficientes ventanas acumuladas para un PID (≥ 10).
-- Si no hay suficientes datos, el ensemble opera con los otros 3 modelos (pesos renormalizados).
-
-### 4.5 ¿Por qué ensemble y no un solo modelo?
-
-| Riesgo de un solo modelo | Cómo el ensemble lo mitiga |
-|---|---|
-| **Overfitting** del modelo único a los datos de entrenamiento | 4 modelos con arquitecturas fundamentalmente diferentes no overfittean de la misma manera. |
-| **Punto ciego** — el modelo único no captura cierto patrón | Si RF no lo ve, XGBoost probablemente sí. Si ambos no lo ven, Isolation Forest puede detectarlo como anomalía. |
-| **Ataque adversarial** — el ransomware evoluciona para evadir un clasificador específico | "Evadir" 4 modelos simultáneamente es exponencialmente más difícil. |
-| **Error de calibración** — un modelo da probabilidades mal calibradas | El voting ponderado suaviza errores individuales de calibración. |
-
-**Voting ponderado:**
-
-```
-p_attack = 0.35 · p_rf + 0.30 · p_xgb + 0.20 · iso_score + 0.15 · p_lstm
-```
-
-Los pesos reflejan:
-- **Confiabilidad esperada** (RF es el más robusto en datos tabulares).
-- **Naturaleza del modelo** (supervisado vs. no supervisado, punto vs. secuencia).
-- **Costo computacional** (LSTM es caro, se usa como "voto de calidad" más que como motor principal).
-
----
-
-## 5. Pipeline de Entrenamiento
-
-### 5.1 Flujo completo
-
-```
-features_labeled.csv
-      │
-      ├─ 1. Carga y validación
-      │     └─ Verificar: 14 columnas de features + label + session (ronda de recolección)
-      │     └─ Verificar: no hay nulos, no hay infinitos
-      │     └─ Grupos = sesión (sin columna session: se deriva por gaps de timestamp)
-      │
-      ├─ 2. Validación cruzada agrupada por sesión
-      │     └─ StratifiedGroupKFold(5 folds, groups=session)
-      │     └─ Las ventanas de una misma sesión/ronda NO se mezclan entre
-      │        train y test (el CV aleatorio medía leakage temporal)
-      │     └─ StandardScaler DENTRO del Pipeline (fit solo con el fold
-      │        de train — antes se escalaba todo antes del CV)
-      │
-      ├─ 3. Balanceo de clases: SIN SMOTE
-      │     └─ class_weight='balanced' (RF) + scale_pos_weight (XGBoost)
-      │     └─ SMOTE interpolaba features binarias/count
-      │        (canary_accessed=0.37 no significa nada) y sintetizaba
-      │        muestras dentro de los folds de test (leakage)
-      │
-      ├─ 4. Holdout agrupado (GroupShuffleSplit 25%)
-      │     └─ classification_report + ROC-AUC + FPR/FNR
-      │
-      ├─ 5. Entrenamiento final (todo el dataset, RansomwareDetector.train)
-      │     ├─ RandomForestClassifier → rf.pkl
-      │     ├─ XGBClassifier → xgb.json
-      │     ├─ IsolationForest (solo datos benignos) → iso_forest.pkl
-      │     └─ LSTM (secuencias de 10 ventanas) → lstm.pt
-      │
-      └─ 7. Evaluación
-            ├─ ROC-AUC (área bajo la curva)
-            ├─ Classification report (precision, recall, f1)
-            ├─ Matriz de confusión
-            ├─ FPR @ FNR=0.01 (false positive rate con 1% de falsos negativos)
-            └─ Feature importance (RF) → exportar para calibración del detector C
-```
-
-### 5.2 Manejo del desbalance de clases
-
-El dataset va a estar **fuertemente desbalanceado**: quizás 10,000 muestras benignas por cada 100 de ataque. Si entrenamos sin balancear, el modelo aprende a decir siempre "benigno" y tiene 99% de accuracy — inútil.
-
-**Estrategia (pesos de clase, sin oversampling sintético):**
-
-1. **class_weight='balanced'** en Random Forest: penaliza más los errores en la clase minoritaria.
-
-2. **scale_pos_weight=10** en XGBoost: 10x más penalización por falso negativo que por falso positivo. Un ataque no detectado cuesta más que una falsa alarma.
-
-3. **IsolationForest** solo con la clase benigna (detección de anomalía): no necesita ejemplos de ataque.
-
-SMOTE se retiró: interpolaba features binarias/count (`canary_accessed=0.37` no significa nada) y sintetizaba muestras dentro de los folds de test (leakage → métricas infladas). El desbalance se maneja con los pesos de clase de arriba.
-
----
-
-## 6. Especificación del Dataset
-
-### 6.1 Formato
-
-Archivo CSV con las siguientes columnas:
-
-```csv
-entropy_mean,entropy_max,entropy_std,entropy_autocorr,write_rate,bytes_written_rate,rename_rate,unlink_rate,read_write_ratio,chi2_stat,ext_change_rate,canary_accessed,unique_dirs,file_type_variety,label
-5.23,7.12,0.89,0.67,12.5,512000,0.0,0.0,4.2,15420.0,0.0,0,2,1,0
-7.89,7.98,0.03,0.09,145.2,8192000,32.1,0.0,1.05,45.3,0.94,1,47,12,1
-```
-
-- **Separador:** coma (`,`)
-- **Encoding:** UTF-8
-- **Sin header opcional** (el pipeline lo maneja)
-- **Label:** `0` = benigno, `1` = ataque
-
-### 6.2 Composición mínima
-
-| Clase | Muestras mínimas | Ideal | Origen |
-|---|---|---|---|
-| **Benigno (0)** | 5,000 | 50,000+ | Capturar en entorno real: editores de texto, navegadores, compiladores, backups, rsync, tar, gzip, git, builds, IDEs. |
-| **Ataque (1)** | 500 | 5,000+ | Ejecutar muestras de ransomware conocido en entorno controlado (VM aislada). Alternativa: simular comportamiento de ransomware con scripts. |
-
-**IMPORTANTE:** No usar datos sintéticos para la clase de ataque. El dataset de ataque debe ser real (ransomware ejecutado en sandbox) o al menos simulación fiel (script que replica el comportamiento de E/S del ransomware — `simulate_ransomware.py` con perfiles de familias reales). El balance de clases se maneja con pesos, no con oversampling.
-
-### 6.3 Recolección de datos benignos
-
-Ejecutar Guardian FS en modo "solo logueo" (sin bloquear) en un entorno de desarrollo real durante al menos 24 horas, capturando eventos de:
-
-- Edición de documentos (LibreOffice, Google Docs, editores de código)
-- Navegación web (caché del navegador)
-- Compilación (gcc, cargo, go build)
-- Backups (rsync, tar, Timeshift)
-- Comunicación (Slack, Discord, Zoom — escrituras de caché)
-- Sistema operativo (logs, systemd journal, actualizaciones)
-
-### 6.4 Recolección de datos de ataque
-
-Ejecutar en VM aislada (SIN conexión de red, SIN acceso al host) muestras de ransomware conocido:
-
-- **LockBit 3.0** — ransomware moderno agresivo, alta velocidad.
-- **Conti** — ransomware con tácticas de evasión (sleeps, baja tasa).
-- **REvil** — cifrado parcial + renombrado agresivo.
-- **Simulador propio** — script Python/C que reproduce el comportamiento de E/S del ransomware (alta entropía, cambio de extensión, recorrido de directorios).
-
-### 6.5 Consideraciones de sesgo
-
-| Riesgo de sesgo | Mitigación |
-|---|---|
-| **Sesgo de entorno** — todos los datos benignos vienen de la misma máquina/usuario | Recolectar en múltiples máquinas, múltiples usuarios, múltiples workloads. |
-| **Sesgo temporal** — los datos de ataque se recolectan en una sola sesión | Ejecutar ransomware en diferentes momentos, con diferentes cargas de sistema. |
-| **Sesgo de herramienta** — el simulador no es ransomware real | Priorizar muestras reales. Usar el simulador solo para aumentar variedad. |
-| **Data leakage** — features calculadas con conocimiento del futuro | Las features se calculan por ventana independiente. No usar información de ventanas futuras para clasificar la ventana actual (excepto LSTM, que por diseño usa secuencias). |
-
----
-
-## 7. Protocolo de Integración C ↔ Python
-
-### 7.1 Socket Unix
-
-```
-analyzer.c                          ml_server.py
-    │                                     │
-    │  socket(AF_UNIX, SOCK_STREAM)       │  socket(AF_UNIX, SOCK_STREAM)
-    │  connect("/tmp/guardian_ml.sock")   │  bind("/tmp/guardian_ml.sock")
-    │                                     │  listen(10)
-    │                                     │
-    │  ──── JSON request ────→            │
-    │  {"pid": 1234,                      │
-    │   "features": [5.2, 7.1, ...]}      │
-    │                                     │  scaler.transform()
-    │                                     │  ensemble.predict()
-    │                                     │
-    │  ←──── JSON response ────           │
-    │  {"p_attack": 0.89,                 │
-    │   "verdict": "attack",              │
-    │   "scores": {                       │
-    │     "rf": 0.92,                     │
-    │     "xgb": 0.88,                    │
-    │     "iso": 0.85,                    │
-    │     "lstm": 0.78                    │
-    │   },                                │
-    │   "top_features": [                 │
-    │     {"name": "entropy_mean",        │
-    │      "importance": 0.28},           │
-    │     ...]}                           │
-    │                                     │
-```
-
-### 7.2 Formato de mensajes
-
-**Request (C → Python):**
-```json
-{
-  "pid": 1234,
-  "features": [
-    7.89, 7.98, 0.03, 0.09, 145.2, 8192000,
-    32.1, 0.0, 1.05, 45.3, 0.94, 1, 47, 12
-  ],
-  "sequence": [                          // opcional, solo si hay ≥ 10 ventanas
-    [5.23, 7.12, ...],                   // ventana t-9
-    [5.45, 7.01, ...],                   // ventana t-8
-    ...                                  // 10 ventanas hacia atrás
-  ]
-}
-```
-
-**Response (Python → C):**
-```json
-{
-  "p_attack": 0.89,
-  "verdict": "attack",
-  "scores": {
-    "rf": 0.92,
-    "xgb": 0.88,
-    "iso": 0.85,
-    "lstm": 0.78
-  },
-  "top_features": [
-    {"name": "entropy_mean", "importance": 0.28},
-    {"name": "ext_change_rate", "importance": 0.22},
-    {"name": "chi2_stat", "importance": 0.18}
-  ],
-  "fallback": false
-}
-```
-
-### 7.3 Umbrales de acción en analyzer.c
-
-```
-p_attack ≥ 0.75 → "attack"
-  → Forzar score del detector a 1.0 → VERDICT_BLOCK en la próxima syscall.
-  → Disparar zfs_snapshot_emergency si el detector C aún no lo hizo.
-
-p_attack ≥ 0.50 → "suspicious"
-  → Aumentar peso de las features de este PID en el detector C.
-  → Loguear para análisis forense.
-
-p_attack < 0.50 → "normal"
-  → Descartar. El proceso es probablemente legítimo.
-```
-
----
-
-## 8. Fallback y Degradación Graceful
-
-El sistema debe funcionar incluso si el servidor ML no está disponible. La seguridad no puede depender de un proceso Python.
-
-### Niveles de degradación:
-
-| Nivel | Qué falló | Qué pasa |
+| | Detector rápido (C) | Modelo ML (Python) |
 |---|---|---|
-| **Nivel 0: Full** | Todo funciona | Detector C + ML ensemble. Máxima precisión. |
-| **Nivel 1: Sin LSTM** | LSTM no disponible (no hay secuencia, PyTorch no instalado) | Ensemble con 3 modelos (RF+XGB+ISO). Pesos renormalizados: 0.44 + 0.37 + 0.19. |
-| **Nivel 2: Sin ML server** | ml_server.py caído o no arrancó | Solo detector C (reglas estadísticas). La detección es más ruidosa pero funcional. |
-| **Nivel 3: Sin modelos entrenados** | Primera ejecución, no hay `.pkl` | ml_server.py usa `_rule_based()` que replica las reglas del detector C. |
-| **Nivel 4: Sin Python** | Python ni siquiera instalado | El sistema corre 100% en C. El analyzer thread loguea eventos y el detector C toma todas las decisiones. |
+| Cuándo opina | En cada escritura, al instante | Cada 5 segundos, mirando el resumen de la ventana |
+| Velocidad | < 1 milisegundo | ~1–5 milisegundos, pero en segundo plano |
+| Estilo | Reglas fijas calibradas a mano | Patrones aprendidos de miles de ejemplos |
+| Si falla… | Nada crítico depende de Python: el ML puede confirmar ataques que las reglas no vieron, pero las reglas solas ya frenan los ataques típicos | El sistema degrada a detección estadística pura y sigue funcionando |
 
-**El detector C NUNCA se desactiva.** Es la última línea de defensa y siempre está activo.
+**El ML nunca es un cuello de botella ni un punto único de falla.** Es una segunda opinión que llega con algunos segundos de demora y sirve para atrapar lo raro.
 
 ---
 
-## 9. Estrategia de Evaluación
+## 2. Qué mira el modelo: las 14 señales
 
-### 9.1 Métricas primarias
+Cada 5 segundos, el sistema resume lo que hizo cada programa en esa ventana y le entrega al modelo un perfil con 14 números. Nada de nombres de archivos ni contenido: solo comportamiento.
 
-| Métrica | Objetivo | Por qué |
+### Las señales sobre los datos escritos (¿parecen cifrados?)
+
+| Señal | En criollo |
+|---|---|
+| Entropía promedio / máxima / variación | Qué tan "revueltos" son los bytes, en promedio, en el peor momento, y qué tan pareja es esa cualidad entre escrituras. El cifrado produce datos revueltos *consistentemente*; los archivos normales van variando. |
+| Correlación de entropía | Si una escritura se parece a la anterior. Un comprimido tiene estructura que se repite; el cifrado es ruido puro, sin parecido entre bloques. |
+| χ² (uniformidad) | Un test de "reparto": en los datos cifrados, cada byte posible aparece más o menos la misma cantidad de veces. En un texto o una imagen, hay bytes que dominan. |
+
+### Las señales de ritmo (¿qué tan frenético es el programa?)
+
+| Señal | En criollo |
+|---|---|
+| Escrituras por segundo | El ransomware cifra a máxima velocidad. |
+| Bytes por segundo | Ídem, medido en volumen. |
+| Renombrados por segundo | Después de cifrar cada archivo, lo renombra (`.docx` → `.locked`). |
+| Borrados por segundo | Algunos borran los backups o los originales. |
+
+### Las señales de "estilo de trabajo"
+
+| Señal | En criollo |
+|---|---|
+| Ratio lectura/escritura | El ransomware lee un archivo y escribe su versión cifrada: ratio cercano a 1. Un backup lee todo y escribe poco. Un programa generador solo escribe. |
+| Proporción de renombrados que cambian la extensión | Casi exclusivo de ransomware. |
+| ¿Tocó un archivo señuelo? | La trampa: señuelos con nombres tentadores que ningún programa honesto modifica. |
+| Cuántas carpetas distintas recorrió | El ransomware barren toda la estructura; un editor trabaja en una o dos carpetas. |
+| Cuántos tipos de archivo distintos tocó | El ransomware cifra de todo (`.docx`, `.pdf`, `.jpg`…); un programa normal toca uno o dos tipos. |
+
+**El punto fino:** ninguna señal alcanza sola. La entropía alta la tiene un `.zip`; el ritmo frenético lo tiene un backup; los renombrados los tiene un `rsync`. El valor está en la **combinación** — y eso es justo lo que un modelo aprende mejor que unas reglas escritas a mano.
+
+---
+
+## 3. Los tres modelos que votan
+
+El servidor (`src/ml_server.py`) no usa un solo modelo: combina tres, cada uno con su fortaleza, y promedia sus opiniones con pesos.
+
+| Modelo | Peso | Su fuerte | Su debilidad |
+|---|---|---|---|
+| **Random Forest** (bosque de árboles de decisión) | 0.35 | Robusto, difícil de engañar con un solo rasgo; además dice qué señales pesaron en cada decisión | Le cuesta el ruido temporal |
+| **XGBoost** (árboles que se corrigen entre sí) | 0.30 | Distinto del anterior: fallan en cosas distintas, se cubren mutuamente | Puede sobreajustarse |
+| **Isolation Forest** (detector de rarezas) | 0.20 | **No necesita ejemplos de ataques**: aprende qué es "normal" y marca lo que se desvía — sirve para ransomware nunca visto | Menos preciso en la frontera difusa |
+
+> Hay un cuarto modelo previsto (una red recurrente/LSTM, peso 0.15) para patrones *temporales* — "escribió mucho, durmió 2 segundos, escribió más". Está implementado pero desactivado: requiere PyTorch y suficientes datos de secuencias. Los pesos de los otros tres se renormalizan solos.
+
+El resultado combinado es una probabilidad de ataque entre 0 y 1:
+
+| Probabilidad | Veredicto | Qué hace el sistema |
 |---|---|---|
-| **Recall (detección)** | > 0.99 | Un ataque no detectado es pérdida de datos. Queremos detectar > 99% de los ataques. |
-| **FPR (false positive rate)** | < 0.01 | Menos de 1 falsa alarma cada 100 procesos legítimos. |
-| **ROC-AUC** | > 0.95 | Área bajo la curva ROC — medida global de calidad del clasificador. |
-| **F1-score (ataque)** | > 0.90 | Balance entre precisión y recall en la clase minoritaria. |
-
-### 9.2 Métricas secundarias
-
-| Métrica | Objetivo | Por qué |
-|---|---|---|
-| **Tiempo hasta detección** | < 3 segundos desde el inicio del ataque | Si tarda más, el ransomware ya cifró cientos de archivos. |
-| **Latencia de inferencia** | < 5ms por request | El analyzer no debe convertirse en cuello de botella. |
-| **Archivos cifrados antes del bloqueo** | < 10 archivos | Con snapshots ZFS cada 60s, máximo 10 archivos afectados. |
-| **Precisión del ensemble vs. detector C solo** | Mejora > 20% en F1 | Justifica la complejidad adicional del ML. |
-
-### 9.3 Validación temporal (backtesting)
-
-El ransomware evoluciona. Un modelo entrenado con datos de 2024 puede fallar contra ransomware de 2026.
-
-**Estrategia:** Validación con split temporal — entrenar con datos hasta fecha T, evaluar con datos posteriores a T. Si el modelo se degrada significativamente, es señal de que necesita reentrenamiento.
+| ≥ 0.75 | `attack` | El detector queda avisado: la próxima operación de ese programa se bloquea (y si el detector rápido no lo había matado todavía, se dispara todo el protocolo: snapshot + kill) |
+| 0.50 – 0.75 | `suspicious` | Se anota para análisis forense; el programa queda bajo observación reforzada |
+| < 0.50 | `normal` | Nada |
 
 ---
 
-## 10. Caminos de Optimización
+## 4. De dónde salen los datos para entrenar
 
-### 10.1 Calibración de pesos del ensemble
+No existe un dataset público para este diseño: las filas no son archivos sueltos, son **ventanas de comportamiento** (qué hizo tal programa durante 5 segundos). Hay que generarlas. El circuito completo lo automatiza `scripts/collect_training_data.sh`:
 
-Los pesos actuales (0.35, 0.30, 0.20, 0.15) son una estimación inicial. Se pueden optimizar con:
+1. Levanta una copia del sistema en modo **sombra** (anota veredictos pero no bloquea ni mata — si matara al simulador en la primera ventana, tendríamos una sola fila por ataque en vez de toda su evolución).
+2. Corre **rondas de ataque** con el simulador propio, variando modo, velocidad, cantidad de procesos y % de cifrado parcial (perfiles calibrados sobre familias reales: LockBit, Conti, REvil).
+3. Corre **rondas benignas** con trabajo de verdad: compilar, git, rsync, logs, backups comprimidos, y los casos difíciles (ver abajo).
+4. Un intermediario (el "proxy") anota cada ventana en `data/training_data.csv` con su etiqueta (0 = benigno, 1 = ataque) y su **sesión** de origen.
 
-```python
-from scipy.optimize import minimize
+Cada ronda queda marcada con su sesión para poder evaluar sin trampas: al medir la calidad del modelo, **las ventanas de una misma corrida van enteras a "entrenar" o a "evaluar"**, nunca repartidas. Si se repartieran, el modelo "se copiaría la respuesta" (ventanas casi idénticas a un lado y otro) y las métricas quedarían infladas.
 
-def ensemble_score(weights, y_true, y_preds):
-    """Busca pesos que maximicen ROC-AUC en validación."""
-    weighted = sum(w * p for w, p in zip(weights, y_preds))
-    return -roc_auc_score(y_true, weighted)  # negativo para minimizar
+### Los casos difíciles que aprendimos por las malas
 
-result = minimize(
-    ensemble_score,
-    x0=[0.35, 0.30, 0.20, 0.15],
-    bounds=[(0.1, 0.5)] * 4,
-    constraints={'type': 'eq', 'fun': lambda w: sum(w) - 1.0}
-)
-```
+La primera versión del dataset tenía un hueco que produjo falsos positivos reales, y vale documentarlo porque es la lección más útil de todo el ML del proyecto:
 
-### 10.2 Feature selection
+- **Programas que escriben bloques idénticos** (heartbeats, páginas de base de datos): entropía bajísima pero *perfectamente constante en el tiempo*. En el dataset original, esa "constancia" solo aparecía en los ataques… así que el modelo la aprendió como firma de ataque y marcaba a estos programas inocentes como atacantes.
+- **Backups comprimidos**: gzip de archivos grandes escribe megas de datos revueltos (¡entropía 8!) a buena velocidad. Sin ejemplos de esta clase, el modelo no tenía con qué distinguirlo de un cifrador.
 
-No todas las features son igualmente útiles. `feature_importances_` de Random Forest nos dice cuáles pesan más. Se puede experimentar con:
-- Eliminar features con importancia < 0.03.
-- Agregar features derivadas: `entropy_mean × write_rate`, `chi2_stat / bytes_written`.
-- Agregar features de segundo orden: `differences` entre ventanas consecutivas.
-
-### 10.3 Ajuste de umbrales
-
-El umbral `p_attack ≥ 0.75 → "attack"` es configurable. Se puede calibrar con curva de precisión-recall:
-- **Priorizar recall** (umbral más bajo, ej. 0.60) → detecta más ataques, más falsos positivos.
-- **Priorizar precisión** (umbral más alto, ej. 0.85) → menos falsas alarmas, puede perder ataques sutiles.
-
-Para un sistema de seguridad, **recall > precisión**. Es preferible una falsa alarma que un ataque no detectado.
-
-### 10.4 Reentrenamiento continuo
-
-Los modelos no son estáticos. Se debe planificar:
-- **Reentrenamiento mensual** con datos nuevos de ataques.
-- **Monitoreo de drift**: si la distribución de features benignas cambia (nueva versión de SO, nuevo software), los modelos necesitan actualizarse.
-- **A/B testing**: nuevo modelo corre en shadow mode (loguea veredictos sin aplicarlos) antes de activarlo.
-
-### 10.5 Del ensemble al stacking
-
-El voting ponderado es simple pero limitado. Un meta-modelo (stacking) puede aprender a combinar las predicciones mejor:
-
-```python
-from sklearn.ensemble import StackingClassifier
-
-meta_learner = LogisticRegression()
-stacking = StackingClassifier(
-    estimators=[('rf', rf), ('xgb', xgb), ('iso', iso)],
-    final_estimator=meta_learner,
-    cv=5  # usa out-of-fold predictions para entrenar el meta-modelo
-)
-```
-
-El stacking aprende automáticamente cuánto confiar en cada modelo según el contexto.
+Moraleja: **un modelo de comportamiento es tan bueno como la variedad de comportamientos benignos que vio**. Las rondas benignas ahora incluyen explícitamente: compilación, git, rsync, logs en paralelo, bloques idénticos, archivos de puros ceros y compresión de datos incomprimibles (que simula archivar fotos/videos/zip).
 
 ---
 
-## Apéndice: Dependencias Python
+## 5. Entrenar (el circuito, en 3 comandos)
 
-Ver `python/requirements.txt`:
+```bash
+# 1. Recolectar (cada corrida suma filas al CSV; más variedad = mejor)
+./scripts/collect_training_data.sh 25
 
+# 2. Entrenar y evaluar (imprime las métricas y guarda los modelos)
+python3 src/train_model.py
+
+# 3. Los modelos quedan en /var/lib/guardian/models/ y el servidor los
+#    carga solo al arrancar — reiniciarlo si estaba corriendo
 ```
-numpy>=1.24           # cómputo numérico
-scikit-learn>=1.3     # RF, IsolationForest, StandardScaler, StratifiedGroupKFold
-xgboost>=2.0          # gradient boosting
-joblib>=1.3           # serialización de modelos
-pandas>=2.0           # carga y manipulación de datos
-matplotlib>=3.7       # visualización (evaluación)
-# torch>=2.0          # opcional: LSTM (solo si hay checkpoint lstm.pt entrenado)
-```
+
+`train_model.py` entrena y evalúa con la misma pieza que después sirve las predicciones (misma clase de Python en `ml_server.py`): lo que se mide es exactamente lo que se despliega. La evaluación imprime, para Random Forest y XGBoost:
+
+- **ROC-AUC** (qué tan bien separa las clases en general; 1.0 es perfecto, 0.5 es adivinar);
+- **precisión / recall** de cada clase;
+- **FPR / FNR** (porcentaje de inocentes acusados / atacantes dejados pasar);
+- y un gráfico de qué señales pesaron más, en `reports/feature_importance.png`.
 
 ---
 
-*Documento generado para guiar al ML Engineer / Data Scientist del equipo. Las decisiones de modelo, features y pesos están fundamentadas en el dominio del problema (detección de ransomware por comportamiento de E/S). Para preguntas técnicas, consultar `docs/architecture/README.md` y `docs/developer-guide.md`.*
+## 6. Cómo saber si el modelo es bueno (sin autoengañarse)
+
+Tres chequeos que valen más que cualquier número aislado:
+
+1. **Las métricas de evaluación** (con separación por sesiones, como se explicó).
+2. **Probar con filas reales del dataset** que el modelo nunca vio agrupadas — el procedimiento está en la bitácora.
+3. **Probar casos sintéticos límite**, uno por clase difícil:
+   - escritor de bloques idénticos → debe dar "normal";
+   - gzip de archivo grande → "normal";
+   - cifrado + renombrados + varias carpetas → "attack".
+
+En la última sesión los tres pasaron, y las 50 ventanas de compresión real del dataset quedaron del lado correcto.
+
+**Letra chica honesta:** el dataset se genera con un simulador, no con malware real ni con usuarios reales. Separar "ataque simulado" de "trabajo simulado" es más fácil que el problema real, así que estas métricas validan el *circuito* (los datos fluyen, el modelo aprende las clases difíciles, los veredictos vuelven al sistema), no que el sistema esté listo para producción. El camino hacia métricas "de verdad" pasa por más variedad benigna (más máquinas, más workloads reales) y, eventualmente, muestras controladas en sandbox.
+
+---
+
+## 7. Referencia rápida de archivos
+
+| Archivo | Rol |
+|---|---|
+| `src/analyzer.c` | Calcula las 14 señales por ventana y las manda por socket |
+| `src/ml_server.py` | Escucha el socket, corre los tres modelos, combina votos |
+| `src/train_model.py` | Evalúa y entrena con el dataset; guarda los modelos |
+| `scripts/ml_proxy.py` | El intermediario que anota toda ventana que pasa (con su etiqueta) |
+| `scripts/collect_training_data.sh` | Automatiza el circuito de recolección completo |
+| `scripts/simulate_ransomware.py` | El atacante simulado (solo VM) |
+| `data/training_data.csv` | El dataset (no se commitea al repo) |
+| `/var/lib/guardian/models/` | Los modelos entrenados (tampoco) |
