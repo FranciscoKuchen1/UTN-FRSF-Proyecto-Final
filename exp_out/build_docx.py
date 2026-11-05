@@ -5,7 +5,7 @@ estadísticas del informe. CORRER DESDE LA RAÍZ DEL REPO."""
 import os
 import pandas as pd
 from docx import Document
-from docx.shared import Pt, Cm
+from docx.shared import Pt, Cm, Twips
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
@@ -125,25 +125,44 @@ def _borders(el, top=None, bottom=None):
     pPr.append(b)
 
 def TABLA(num, titulo, header, rows, widths=None):
-    # caption (estilo IEEE: arriba, "TABLA N" + título)
+    # caption (estilo IEEE: arriba, "TABLA N" la agrega el estilo)
     P(titulo.upper(), style="table head", align=WD_ALIGN_PARAGRAPH.CENTER)
+    # ancho total = ancho de columna IEEE A4 (~8.6 cm = 4880 twips)
+    TOTAL = 4880
+    if widths is None:
+        widths = [1] * len(header)
+    s = sum(widths)
+    widths = [int(TOTAL * w / s) for w in widths]
     t = doc.add_table(rows=len(rows) + 1, cols=len(header))
     t.alignment = WD_TABLE_ALIGNMENT.CENTER
-    t.autofit = True
+    t.autofit = False
+    # ancho total de la tabla (dxa) — sin esto Word/LibreOffice usan página completa
+    tblPr = t._tbl.tblPr
+    tblW = tblPr.find(qn("w:tblW"))
+    if tblW is None:
+        tblW = OxmlElement("w:tblW"); tblPr.append(tblW)
+    tblW.set(qn("w:type"), "dxa"); tblW.set(qn("w:w"), str(TOTAL))
     for j, h in enumerate(header):
         cell = t.rows[0].cells[j]
-        cell.paragraphs[0].style = doc.styles["table col head"]
-        cell.paragraphs[0].add_run(h)
-        _borders(cell.paragraphs[0]._p, bottom=[("bottom", "single", "8")])
+        cell.width = Twips(widths[j])
+        p = cell.paragraphs[0]
+        p.style = doc.styles["table col head"]
+        p.add_run(h)
+        # línea bajo el encabezado: borde de CELDA (continuo), no de párrafo
+        tcPr = cell._tc.get_or_add_tcPr()
+        b = OxmlElement("w:tcBorders")
+        e = OxmlElement("w:bottom")
+        e.set(qn("w:val"), "single"); e.set(qn("w:sz"), "8")
+        e.set(qn("w:space"), "0"); e.set(qn("w:color"), "000000")
+        b.append(e); tcPr.append(b)
     for i, row in enumerate(rows):
         for j, v in enumerate(row):
             cell = t.rows[i + 1].cells[j]
+            cell.width = Twips(widths[j])
             p = cell.paragraphs[0]
             p.style = doc.styles["table copy"]
             p.add_run(str(v))
-    # reglas IEEE: línea sobre cabecera, línea al pie de la tabla
-    tbl = t._tbl
-    tblPr = tbl.tblPr
+    # reglas IEEE: línea sobre la tabla y línea al pie
     borders = OxmlElement("w:tblBorders")
     for side in ("top", "bottom"):
         e = OxmlElement(f"w:{side}")
@@ -153,7 +172,7 @@ def TABLA(num, titulo, header, rows, widths=None):
     tblPr.append(borders)
     return t
 
-def FIGURA(png, caption, width_cm=8.7):
+def FIGURA(png, caption, width_cm=8.3):
     if not os.path.exists(png):
         print("WARN falta figura:", png); return
     p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -219,7 +238,7 @@ TABLA("I", "Estado de avance respecto del cronograma",
         "En curso avanzado"],
        ["Mes 7 — Análisis de resultados",
         "Métricas comparativas de la Sección 5; procesamiento estadístico final: pendiente.",
-        "Iniciado"]])
+        "Iniciado"]], widths=[1.0, 2.2, 1.0])
 P("Síntesis: el prototipo de ambos módulos (detección y recuperación) opera de extremo a "
   "extremo sobre el conjunto base de pruebas; resta la fase de destrucción con muestras "
   "reales de las familias de referencia y el análisis estadístico final.", style="Body Text")
@@ -276,7 +295,8 @@ H2("Resultados con la metodología sin fuga")
 TABLA("II", "Métricas del modelo (validación cruzada agrupada por sesión y holdout agrupado)",
       ["Modelo", "ROC-AUC (CV)", "ROC-AUC (holdout)", "FPR", "FNR"],
       [["Random Forest", "1.0000 ± 0.0000", "1.0000", "0.0000", "0.0000"],
-       ["XGBoost", "1.0000 ± 0.0000", "0.9997", "0.0000", "0.0145"]])
+       ["XGBoost", "1.0000 ± 0.0000", "0.9997", "0.0000", "0.0145"]],
+      widths=[1.1, 1.15, 1.15, 0.8, 0.8])
 P("La verificación sobre datos no vistos clasifica correctamente 80/80 ventanas benignas "
   "y 80/80 de ataque, incluidas las 50 ventanas reales de compresión (entropía > 7). Los "
   "falsos positivos de las clases difíciles pasaron de probabilidades de ataque 0.76 y "
@@ -314,7 +334,7 @@ try:
                      (str(int(r.archivos_perdidos_final)) if str(r.archivos_perdidos_final) not in ("", "nan") else "—")])
     TABLA("III", "Mismo ataque (full, 40 archivos) bajo tres configuraciones",
           ["Escenario", "Duración (s)", "Archivos cifrados", "RTO (s)", "Pérdida final (archivos)"],
-          rows)
+          rows, widths=[1.3, 0.85, 1.0, 0.8, 1.15])
 except Exception as e:
     print("WARN tabla escenarios:", e)
 P("La duración en los escenarios sin detección es el tiempo de cifrado completo del "
@@ -338,7 +358,7 @@ try:
                      wall])
     TABLA("IV", "Campaña de detección por perfil (3 corridas c/u, modo enforce)",
           ["Perfil", "Neutralizadas", "Archivos .locked (mediana)", "KiB cifrados (mediana)", "Tiempo hasta freno (s)"],
-          rows)
+          rows, widths=[1.1, 1.0, 1.2, 0.95, 1.0])
 except Exception as e:
     print("WARN tabla perfiles:", e)
 P(f"Resultados globales: 18 de 18 corridas neutralizadas (100%), con una pérdida "
@@ -366,7 +386,7 @@ try:
         rows.append([w.replace("_", " "), f"{d:.0f}", f"{v:.0f}", f"{S['ov'][w]:+d}%"])
     TABLA("V", "Tiempo mediano (ms) de cargas benignas: directo ZFS vs. Guardian FS",
           ["Carga", "Directo (ms)", "Guardian FS (ms)", "Sobrecosto"],
-          rows)
+          rows, widths=[1.5, 1.05, 1.05, 0.95])
     ov_txt = ", ".join(f"{w.replace('_', ' ')} {v:+d}%" for w, v in S["ov"].items())
 except Exception as e:
     print("WARN tabla bench:", e); ov_txt = "—"
@@ -396,7 +416,8 @@ try:
     rows = [[r.workload, str(int(r.blocked_events)), str(int(r.killed_events)),
              ("sí" if str(r.completo) == "si" else "NO")] for _, r in fp.iterrows()]
     TABLA("VI", "Campaña de falsos positivos del detector (modo enforce)",
-          ["Carga benigna", "Bloqueos", "Procesos muertos", "¿Completó?"], rows)
+          ["Carga benigna", "Bloqueos", "Procesos muertos", "¿Completó?"], rows,
+          widths=[1.6, 0.9, 0.95, 0.9])
 except Exception as e:
     print("WARN tabla fp:", e)
 P("Dos de las ocho cargas benignas fueron terminadas (git y rsync), ambas por la misma "
