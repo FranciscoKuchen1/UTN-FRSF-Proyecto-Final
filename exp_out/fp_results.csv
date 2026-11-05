@@ -1,0 +1,9 @@
+workload,blocked_events,killed_events,duracion_s,completo
+cp_r,0,0,2,si
+tar_czf,0,0,0,si
+gzip_big,0,0,5,si
+gcc,0,0,6,si
+git,1,1,4,NO
+appends,0,0,0,si
+rsync,1,1,1,NO
+lectura,0,0,0,si

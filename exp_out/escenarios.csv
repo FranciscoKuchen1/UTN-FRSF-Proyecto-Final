@@ -1,0 +1,4 @@
+escenario,duracion_s,archivos_cifrados,bytes_cifrados,rto_s,archivos_perdidos_final,bytes_perdidos_final,nota
+sin_proteccion,0.192,40,100400,,40,100400,100pct_perdida_sin_recuperacion
+zfs_solo,0.154,40,100400,0.048,20,1770680,trabajo_legitimo_post_snapshot_perdido
+zfs_guardian,0.095,1,2440,0.029,1,2440,neutralizado_y_restaurado
